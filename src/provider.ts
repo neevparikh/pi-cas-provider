@@ -20,7 +20,7 @@ import {
   type SimpleStreamOptions,
   type Context,
 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 import { piToTranscript } from "./transcript.js";
 import { createPiSessionStore } from "./session-store.js";
@@ -256,6 +256,33 @@ function streamViaSDK(
 
 /* ----------------------------- slash commands ----------------------------- */
 
+/**
+ * Output helper: emit text to the user from a slash command.
+ *
+ * For short single-line status, `ctx.ui.notify` is ideal (transient banner).
+ * For multi-line content we want it to land in the chat scrollback so the user
+ * can read and reference it. Pi exposes `pi.sendMessage` for that — sending a
+ * `customType` with a `display.kind: "text"` shows the text inline in the
+ * session and persists in the transcript.
+ *
+ * The previous implementation called `ctx.sendMessage?.(...)` which silently
+ * no-op'd: `sendMessage` does NOT exist on `ExtensionCommandContext` (only on
+ * the top-level `ExtensionAPI`), and the optional-chain hid the missing method.
+ */
+function emit(pi: ExtensionAPI, ctx: any, customType: string, text: string): void {
+  // Short single-line: a notify banner works well.
+  if (!text.includes("\n")) {
+    ctx.ui.notify(text, "info");
+    return;
+  }
+  // Multi-line: send a custom message into the chat scrollback.
+  pi.sendMessage({
+    customType,
+    content: text,
+    display: true,
+  });
+}
+
 function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig): void {
   pi.registerCommand("cas-auth", {
     description: "Show pi-cas-provider auth status",
@@ -265,37 +292,40 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig): void {
         configDir: config.configDirOverride,
         apiKeyOverride: !!config.apiKeyOverride,
       });
-      await ctx.sendMessage?.({
-        customType: "pi-cas/auth",
-        content: text,
-        display: { kind: "text", text },
-      });
+      emit(pi, ctx, "pi-cas/auth", text);
     },
   });
 
   pi.registerCommand("cas-fast", {
     description: "Toggle pi-cas fast mode for this session (on/off/status)",
+    getArgumentCompletions: (prefix) => {
+      const opts = ["on", "off", "status"];
+      const matches = opts.filter((o) => o.startsWith(prefix.toLowerCase()));
+      return matches.length ? matches.map((o) => ({ value: o, label: o })) : null;
+    },
     handler: async (args: string, ctx: any) => {
       const arg = args.trim().toLowerCase();
+      let changed = false;
       if (arg === "on") {
         config.fastMode = true;
         config.fastModeWarned = false;
+        changed = true;
       } else if (arg === "off") {
         config.fastMode = false;
         config.fastModeWarned = false;
-      } else if (arg && arg !== "status") {
-        // ignore unknown argument; treat as status
+        changed = true;
       }
+      // Always emit current state; if changed, lead with the action.
+      const heading = changed
+        ? `pi-cas fast mode → ${config.fastMode ? "ON" : "off"}`
+        : `pi-cas fast mode: ${config.fastMode ? "ON" : "off"}`;
       const text =
-        `pi-cas fast mode: ${config.fastMode ? "ON" : "off"}\n` +
-        `  (only takes effect on claude-opus-4-6 / claude-opus-4-7; ` +
-        `silently ignored on other models)\n` +
-        `  $30/$150 per MTok when active. See /cas-auth for entitlement.`;
-      await ctx.sendMessage?.({
-        customType: "pi-cas/fast",
-        content: text,
-        display: { kind: "text", text },
-      });
+        `${heading}\n` +
+        `  Only takes effect on claude-opus-4-6 / claude-opus-4-7 ` +
+        `(silently ignored on other models).\n` +
+        `  $30/$150 per MTok when active — ~30x standard Opus pricing.\n` +
+        `  See /cas-auth for entitlement.`;
+      emit(pi, ctx, "pi-cas/fast", text);
     },
   });
 
@@ -304,16 +334,12 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig): void {
     handler: async (_args: string, ctx: any) => {
       const text = [
         "pi-cas-provider status:",
-        `  fast mode:         ${config.fastMode ? "on" : "off"}`,
-        `  config dir:        ${config.configDirOverride ?? "(default ~/.claude)"}`,
-        `  api key override:  ${config.apiKeyOverride ? "PI_CAS_API_KEY set" : "no"}`,
+        `  fast mode:           ${config.fastMode ? "on" : "off"}`,
+        `  config dir:          ${config.configDirOverride ?? "(default ~/.claude)"}`,
+        `  api key override:    ${config.apiKeyOverride ? "PI_CAS_API_KEY set" : "no"}`,
         `  active SDK sessions: ${config.sdkSessionIds.size}`,
       ].join("\n");
-      await ctx.sendMessage?.({
-        customType: "pi-cas/status",
-        content: text,
-        display: { kind: "text", text },
-      });
+      emit(pi, ctx, "pi-cas/status", text);
     },
   });
 }
