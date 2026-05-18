@@ -6,6 +6,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { loadState } from "./persistence.js";
+
 export interface ProviderConfig {
   /** Whether fast mode should be enabled for the next request. */
   fastMode: boolean;
@@ -32,9 +34,28 @@ export interface ProviderConfig {
   lastModel?: string;
 }
 
+/**
+ * Resolve the effective fastMode default with this precedence:
+ *   1. Explicit env var (PI_CAS_FAST_MODE in {"1","true","0","false"})
+ *      — per-launch override, wins over everything.
+ *   2. Persisted state from ~/.pi/agent/pi-cas.json (set via `/cas-fast on|off`)
+ *      — sticky user preference across sessions.
+ *   3. false — safe default.
+ *
+ * Env wins over persisted on purpose: it lets you flip behavior for a one-off
+ * launch (`PI_CAS_FAST_MODE=0 pi ...`) without rewriting the saved preference.
+ */
+function resolveInitialFastMode(persisted: boolean | undefined): boolean {
+  const env = process.env.PI_CAS_FAST_MODE;
+  if (env === "1" || env === "true") return true;
+  if (env === "0" || env === "false") return false;
+  return persisted ?? false;
+}
+
 export function createDefaultConfig(): ProviderConfig {
+  const persisted = loadState();
   return {
-    fastMode: process.env.PI_CAS_FAST_MODE === "1" || process.env.PI_CAS_FAST_MODE === "true",
+    fastMode: resolveInitialFastMode(persisted.fastMode),
     fastModeWarned: false,
     configDirOverride: process.env.PI_CAS_CLAUDE_CONFIG_DIR,
     apiKeyOverride: process.env.PI_CAS_API_KEY,

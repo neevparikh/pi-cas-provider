@@ -9,14 +9,20 @@ The motivating use case is **[Claude Code fast mode](https://code.claude.com/doc
 on Opus 4.6 / 4.7 — a premium-rate, lower-latency inference path that is only reachable
 through Claude Code's settings layer, not the raw Messages API.
 
-> **Anthropic Terms of Service** — Claude Code's OAuth login credentials are scoped to
-> Claude Code as a product; routing them through third-party agents (including pi via this
-> extension) is **not** intended use. To stay within the TOS, this provider expects your
-> Claude Code installation to be authenticated with an **API key** (`ANTHROPIC_API_KEY`,
-> Anthropic Console billing). Fast-mode usage is billed under your Anthropic Console
-> account just like any other API call. If your `claude` CLI is signed in via
-> `/login` (Pro / Max subscription OAuth), do not use this provider with that auth state —
-> sign out first or set `ANTHROPIC_API_KEY` in the pi environment to override.
+> **Anthropic Terms of Service — billing mode matters.** Claude Code's `/login`
+> can land you in one of two auth states. Only one is appropriate for this provider:
+>
+> | Auth state | Billing | OK for this provider? |
+> |---|---|---|
+> | `ANTHROPIC_API_KEY` env var (Console key) | Anthropic Console / API rates | **Yes** |
+> | `claude /login` → Anthropic Console (managed key) | Anthropic Console / API rates | **Yes** |
+> | `claude /login` → Claude.ai (Pro / Max / Team subscription) | Your subscription | **No** — those credentials are TOS-scoped to Claude Code as a product |
+>
+> `/cas-auth` classifies your current state explicitly. The provider does not refuse
+> to run on subscription auth (it can't — the actual API call happens inside the
+> `claude` subprocess), but it warns loudly. To switch off subscription auth, run
+> `claude /login` again and pick the **Anthropic Console** option, or set
+> `ANTHROPIC_API_KEY` / `PI_CAS_API_KEY` in pi's env.
 
 ## What you get
 
@@ -68,8 +74,9 @@ PI_CAS_FAST_MODE=1 pi --provider pi-cas --model claude-opus-4-7
 ## Requirements
 
 - pi (`@earendil-works/pi-coding-agent`) ≥ 0.70.0
-- The `claude` CLI installed and authenticated **with an API key**
-  (`ANTHROPIC_API_KEY`, set on the Anthropic Console)
+- The `claude` CLI installed and authenticated with **either** a raw
+  `ANTHROPIC_API_KEY` **or** `claude /login` → Anthropic Console (managed key).
+  Subscription OAuth (Pro/Max) is *not* supported — see the TOS note above.
 - An Anthropic org with **extra usage enabled** if you want fast mode
   ([requirements](https://code.claude.com/docs/en/fast-mode#requirements))
 
@@ -92,6 +99,63 @@ All optional. Set as environment variables before launching pi.
 | `/cas-auth` | Show auth status, identity, and fast-mode entitlement. |
 | `/cas-fast on` / `off` / `status` | Toggle or inspect fast mode for this pi session. |
 | `/cas-status` | Show provider configuration and active SDK session count. |
+
+## UI: fast-mode badge
+
+When fast mode is requested, pi-cas displays a `⚡` glyph in pi's footer status
+bar via `ctx.ui.setStatus("pi-cas-fast", …)`. The status entry is keyed, so it
+stacks safely with any other extension's status text — no single-owner
+conflict like `setHeader`/`setFooter`.
+
+The glyph color encodes ground truth:
+
+| Color | Meaning |
+|---|---|
+| bright (`warning`) | API engaged fast mode on the last turn — billing premium |
+| muted | Requested but no turn has completed yet |
+| dim | Requested but the API returned `fast_mode_state: off` — not engaged, no premium charge |
+| red (`error`) | Cooldown — fast-mode pool depleted |
+| (no glyph) | Fast mode is off |
+
+## Event bus: `pi-cas:fast-mode`
+
+The provider also broadcasts its fast-mode state on pi's inter-extension event
+bus so other extensions can render their own badge wherever they own real
+estate (footer, header, editor border, terminal title, etc.) without touching
+pi-cas internals.
+
+**Channel:** `pi-cas:fast-mode`
+
+**Payload:**
+
+```ts
+interface FastModeEvent {
+  /** What pi-cas will request on the next turn. */
+  intent: boolean;
+  /** What the API actually engaged on the most recent turn, if known. */
+  actual?: "on" | "off" | "cooldown";
+  /** Model id from the most recent turn (if any). */
+  model?: string;
+}
+```
+
+**Emission points:**
+- Startup (intent only)
+- `/cas-fast on|off` toggle (intent + last-known actual)
+- After every turn (intent + freshly-reported actual + model)
+
+**Example subscriber** (no hard dependency on pi-cas-provider — if it's not
+loaded, the event simply never fires and your badge stays inert):
+
+```ts
+pi.events.on("pi-cas:fast-mode", (data) => {
+  const { intent, actual } = data as { intent: boolean; actual?: "on" | "off" | "cooldown" };
+  // …render your badge however you like…
+});
+```
+
+[pi-vim](https://github.com/neevparikh/pi-vim) ships a built-in subscriber that
+paints the same ⚡ glyph next to its mode label.
 
 ## Auth
 

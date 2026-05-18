@@ -30,12 +30,14 @@ import { mapEffort } from "./effort.js";
 import { buildFastModeOptions, modelSupportsFastMode } from "./settings.js";
 import { createEventBridge } from "./event-bridge.js";
 import { getAuthStatus, formatAuthBanner, formatAuthDetails } from "./auth.js";
+import { FastModeBadge } from "./badge.js";
 import {
   type ProviderConfig,
   createDefaultConfig,
   PROVIDER_ID,
   PROJECT_KEY,
 } from "./config.js";
+import { loadState, saveState, statePath } from "./persistence.js";
 
 /** Top-level entry called by index.ts. */
 export function registerProvider(pi: ExtensionAPI): void {
@@ -46,14 +48,26 @@ export function registerProvider(pi: ExtensionAPI): void {
   // Module-level config; slash commands mutate this.
   const config: ProviderConfig = createDefaultConfig();
   if (config.fastMode) {
-    console.error("[pi-cas] fast mode enabled at startup (PI_CAS_FAST_MODE)");
+    const env = process.env.PI_CAS_FAST_MODE;
+    const source =
+      env === "1" || env === "true"
+        ? "PI_CAS_FAST_MODE"
+        : `persisted preference (${statePath()})`;
+    console.error(`[pi-cas] fast mode enabled at startup — source: ${source}`);
   }
   if (config.configDirOverride) {
     console.error(`[pi-cas] CLAUDE_CONFIG_DIR override: ${config.configDirOverride}`);
   }
 
+  // Badge: emits `pi-cas:fast-mode` events + owns the `pi-cas-fast` status
+  // entry in the footer. Both surfaces are no-ops for anyone who doesn't
+  // subscribe / doesn't render the footer, so this is purely additive.
+  const badge = new FastModeBadge(pi);
+  // Broadcast initial intent so subscribers can render before the first turn.
+  badge.update({ intent: config.fastMode });
+
   // Slash commands
-  registerSlashCommands(pi, config);
+  registerSlashCommands(pi, config, badge);
 
   // Provider registration: take pi's Anthropic model catalog and present it
   // under our provider id with our custom streamSimple.
@@ -67,14 +81,23 @@ export function registerProvider(pi: ExtensionAPI): void {
     maxTokens: m.maxTokens,
   }));
 
+  // Pi treats `apiKey` as an env-var name first, falling back to a literal.
+  // Our real auth is whatever the `claude` subprocess uses (API key or Console
+  // OAuth), so we don't need a key here — but pi shows "Not logged in" in the
+  // footer if the value doesn't resolve. Set the env var to a non-empty
+  // sentinel so pi's auth-presence check passes. The value is never used.
+  if (!process.env.PI_CAS_UNUSED) {
+    process.env.PI_CAS_UNUSED = "managed-by-claude-subprocess";
+  }
+
   pi.registerProvider(PROVIDER_ID, {
     name: "Claude (via Agent SDK)",
     baseUrl: PROVIDER_ID,         // unused, but pi requires it
-    apiKey: "PI_CAS_UNUSED",      // unused — actual auth via subprocess env
+    apiKey: "PI_CAS_UNUSED",      // satisfies pi's auth-presence check only
     api: PROVIDER_ID as any,
     models,
     streamSimple: (model, context, options) =>
-      streamViaSDK(model, context as Context, options, config),
+      streamViaSDK(model, context as Context, options, config, badge),
   });
 }
 
@@ -85,6 +108,7 @@ function streamViaSDK(
   context: Context,
   options: SimpleStreamOptions | undefined,
   config: ProviderConfig,
+  badge: FastModeBadge,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
 
@@ -230,6 +254,14 @@ function streamViaSDK(
     if (DEBUG && fms) {
       console.error(`[pi-cas/debug] fast_mode_state=${fms}, cost=$${bridge.getCost()?.toFixed(4) ?? "?"}`);
     }
+    // Re-broadcast badge state with the just-confirmed `actual`. Dims the
+    // footer glyph (and any subscribed extension's UI) if the API refused to
+    // engage fast mode despite our request.
+    badge.update({
+      intent: config.fastMode,
+      actual: config.lastFastModeState,
+      model: config.lastModel,
+    });
     // One-shot warning when we *requested* fast mode and the API authoritatively
     // refused it. Only fires if fms is reported (the API echoed it back) — we
     // don't speculate based on local config.
@@ -289,7 +321,7 @@ function emit(pi: ExtensionAPI, ctx: any, customType: string, text: string): voi
   });
 }
 
-function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig): void {
+function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: FastModeBadge): void {
   pi.registerCommand("cas-auth", {
     description: "Show pi-cas-provider auth status",
     handler: async (_args: string, ctx: any) => {
@@ -321,16 +353,42 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig): void {
         config.fastModeWarned = false;
         changed = true;
       }
+      // Persist the new preference so it sticks across sessions. Best-effort:
+      // saveState swallows errors, so a read-only home won't break the toggle
+      // for the current session. We only write on actual changes to avoid
+      // touching the file when `/cas-fast` is used as a read.
+      if (changed) {
+        saveState({ fastMode: config.fastMode });
+        // Reflect the new intent in the badge + event bus immediately. We
+        // intentionally don't pass `actual` here: a toggle doesn't change the
+        // last-turn ground truth (the next turn will). The badge renderer
+        // treats absent `actual` as "unknown / muted".
+        badge.update({
+          intent: config.fastMode,
+          actual: config.fastMode ? config.lastFastModeState : undefined,
+          model: config.lastModel,
+        });
+      }
+
       // Always emit current state; if changed, lead with the action.
       const heading = changed
-        ? `pi-cas fast mode → ${config.fastMode ? "ON" : "off"}`
+        ? `pi-cas fast mode → ${config.fastMode ? "ON" : "off"} (saved)`
         : `pi-cas fast mode: ${config.fastMode ? "ON" : "off"}`;
+      // If env var is set, warn that it will override the persisted value on
+      // next launch — otherwise users will be confused why /cas-fast off
+      // "didn't stick" after a restart.
+      const envNote =
+        process.env.PI_CAS_FAST_MODE !== undefined
+          ? `\n  Note: PI_CAS_FAST_MODE=${process.env.PI_CAS_FAST_MODE} is set; ` +
+            `it overrides the saved value on next launch.`
+          : "";
       const text =
         `${heading}\n` +
         `  Only takes effect on claude-opus-4-6 / claude-opus-4-7 ` +
         `(silently ignored on other models).\n` +
         `  $30/$150 per MTok when active — ~30x standard Opus pricing.\n` +
-        `  See /cas-auth for entitlement.`;
+        `  Preference persisted to ${statePath()}.\n` +
+        `  See /cas-auth for entitlement.${envNote}`;
       emit(pi, ctx, "pi-cas/fast", text);
     },
   });
@@ -358,6 +416,7 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig): void {
         `  config dir:          ${config.configDirOverride ?? "(default ~/.claude)"}`,
         `  api key override:    ${config.apiKeyOverride ? "PI_CAS_API_KEY set" : "no"}`,
         `  active SDK sessions: ${config.sdkSessionIds.size}`,
+        `  persisted state:     ${statePath()}`,
       ];
 
       // Helpful hint when intent and reality disagree.
