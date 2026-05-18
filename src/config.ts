@@ -21,6 +21,15 @@ export interface ProviderConfig {
    * though we re-inject history each turn via sessionStore.load() regardless.
    */
   sdkSessionIds: Map<string, string>;
+  /**
+   * fast_mode_state reported by the API on the most recent request, if any.
+   * This is ground truth: pi-cas may have *requested* fast mode, but the API
+   * decides whether it actually engaged (e.g., off if extra-usage isn't
+   * enabled on the org or the model doesn't support it).
+   */
+  lastFastModeState?: "off" | "cooldown" | "on";
+  /** Model id from the most recent request, for /cas-status context. */
+  lastModel?: string;
 }
 
 export function createDefaultConfig(): ProviderConfig {

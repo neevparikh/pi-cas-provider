@@ -46,7 +46,7 @@ export function getAuthStatus(env?: NodeJS.ProcessEnv): AuthStatus {
       orgId: parsed.orgId,
       orgName: parsed.orgName,
     };
-    out.hasExtraUsage = detectExtraUsage();
+    out.hasExtraUsage = detectExtraUsage(out.authMethod);
     return out;
   } catch (err) {
     return {
@@ -60,11 +60,22 @@ export function getAuthStatus(env?: NodeJS.ProcessEnv): AuthStatus {
 
 /**
  * Look up `hasExtraUsageEnabled` from the OAuth account record in `~/.claude.json`,
- * if present. This is the gating flag for fastMode availability. For API-key users
- * it lives at the org level on Anthropic's side; we can't see it from here, so we
- * return undefined ("unknown") and rely on the at-runtime fast_mode_state check.
+ * if present. This is the gating flag for fastMode availability.
+ *
+ * IMPORTANT: this flag is only meaningful for OAuth (Pro/Max/Team/Console) users.
+ * For API-key users the entitlement lives at the org level on Anthropic's side
+ * and is NOT visible from this local file. We return undefined ("unknown") for
+ * those users and rely on the runtime `fast_mode_state` reported by the API.
+ *
+ * Returns:
+ *   true       — extra usage definitively enabled (OAuth user, flag set true)
+ *   false      — extra usage definitively disabled (OAuth user, flag set false)
+ *   undefined  — unknown (API-key user, or no oauthAccount block, or read error)
  */
-function detectExtraUsage(): boolean | undefined {
+function detectExtraUsage(authMethod?: string): boolean | undefined {
+  // For API-key auth, this local file does not reflect entitlement state.
+  // Return undefined and let the runtime fast_mode_state be the source of truth.
+  if (authMethod === "api_key") return undefined;
   try {
     const path = join(homedir(), ".claude.json");
     if (!existsSync(path)) return undefined;

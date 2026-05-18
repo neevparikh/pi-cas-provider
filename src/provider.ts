@@ -223,16 +223,22 @@ function streamViaSDK(
       return;
     }
 
-    // Fast-mode availability warning (one-shot per pi session).
+    // Capture ground-truth fast-mode state for /cas-status to surface.
     const fms = bridge.getFastModeState();
+    config.lastModel = model.id;
+    if (fms) config.lastFastModeState = fms;
     if (DEBUG && fms) {
       console.error(`[pi-cas/debug] fast_mode_state=${fms}, cost=$${bridge.getCost()?.toFixed(4) ?? "?"}`);
     }
+    // One-shot warning when we *requested* fast mode and the API authoritatively
+    // refused it. Only fires if fms is reported (the API echoed it back) — we
+    // don't speculate based on local config.
     if (fastModeRequested && fms === "off" && !config.fastModeWarned) {
       config.fastModeWarned = true;
       console.warn(
         "[pi-cas] fast mode was requested but the API returned fast_mode_state=off. " +
-        "Your org may not have extra-usage enabled — see " +
+        "Either your org lacks the extra-usage entitlement, or the selected model " +
+        `(${model.id}) doesn't support fast mode (Opus 4.6/4.7 only). See ` +
         "https://code.claude.com/docs/en/fast-mode#requirements",
       );
     }
@@ -330,16 +336,39 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig): void {
   });
 
   pi.registerCommand("cas-status", {
-    description: "Show pi-cas-provider configuration",
+    description: "Show pi-cas-provider configuration and last-turn ground truth",
     handler: async (_args: string, ctx: any) => {
-      const text = [
+      // Distinguish *intent* (what pi-cas will request) from *reality* (what
+      // the API actually returned on the most recent turn). These can diverge:
+      // intent=on + reality=off means the API silently downgraded.
+      const intent = config.fastMode ? "on" : "off";
+      const realityLabel =
+        config.lastFastModeState === undefined
+          ? "(no request yet this session)"
+          : config.lastFastModeState === "on"
+            ? `on — confirmed by API on last turn${config.lastModel ? ` (${config.lastModel})` : ""}`
+            : config.lastFastModeState === "cooldown"
+              ? "cooldown — fast-mode pool depleted, API throttling"
+              : `off — API did not engage fast mode on last turn${config.lastModel ? ` (${config.lastModel})` : ""}`;
+
+      const lines = [
         "pi-cas-provider status:",
-        `  fast mode:           ${config.fastMode ? "on" : "off"}`,
+        `  fast mode (intent):  ${intent}`,
+        `  fast mode (actual):  ${realityLabel}`,
         `  config dir:          ${config.configDirOverride ?? "(default ~/.claude)"}`,
         `  api key override:    ${config.apiKeyOverride ? "PI_CAS_API_KEY set" : "no"}`,
         `  active SDK sessions: ${config.sdkSessionIds.size}`,
-      ].join("\n");
-      emit(pi, ctx, "pi-cas/status", text);
+      ];
+
+      // Helpful hint when intent and reality disagree.
+      if (config.fastMode && config.lastFastModeState === "off") {
+        lines.push("");
+        lines.push("Note: you requested fast mode but the API returned off on the last turn.");
+        lines.push("  - On Opus 4.6/4.7? Otherwise the setting is silently ignored.");
+        lines.push("  - Does your org have extra-usage enabled? See /cas-auth.");
+      }
+
+      emit(pi, ctx, "pi-cas/status", lines.join("\n"));
     },
   });
 }
