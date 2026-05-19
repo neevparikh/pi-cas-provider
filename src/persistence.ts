@@ -20,6 +20,17 @@ import { dirname, join } from "node:path";
 export interface PersistedState {
   /** Sticky fast-mode preference. Env var still wins per-launch. */
   fastMode?: boolean;
+  /**
+   * Okta-OAuth-routed relay configuration. When `enabled`, pi-cas asks the
+   * event bus for a baseUrl + access token before each turn and routes the
+   * `claude` subprocess through that endpoint, bypassing api.anthropic.com.
+   * `provider` optionally pins which extension on the bus should answer
+   * (e.g. "hawk"); absent means "first responder wins".
+   */
+  okta?: {
+    enabled?: boolean;
+    provider?: string;
+  };
 }
 
 /** Where we persist. Overridable for tests via PI_CAS_STATE_PATH. */

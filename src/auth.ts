@@ -142,8 +142,21 @@ function billingLabel(mode: BillingMode): string {
   }
 }
 
+export interface BannerOpts {
+  /**
+   * Okta-relay state. When `enabled`, local Claude Code auth is irrelevant
+   * (the subprocess gets its credential from the relay responder), so the
+   * banner reports that instead of classifying Console/subscription/api_key.
+   */
+  okta?: { enabled: boolean; provider?: string };
+}
+
 /** Single-line description for startup banner. */
-export function formatAuthBanner(s: AuthStatus): string {
+export function formatAuthBanner(s: AuthStatus, opts: BannerOpts = {}): string {
+  if (opts.okta?.enabled) {
+    const who = opts.okta.provider ?? "any pi-cas:relay-request responder";
+    return `okta relay mode — routing via "${who}" (local Claude Code auth unused)`;
+  }
   if (!s.loggedIn) {
     return "not authenticated — run `claude /login` (pick Console) or set ANTHROPIC_API_KEY";
   }
@@ -156,7 +169,32 @@ export function formatAuthBanner(s: AuthStatus): string {
 export function formatAuthDetails(s: AuthStatus, opts: {
   configDir?: string;
   apiKeyOverride: boolean;
+  okta?: { enabled: boolean; provider?: string; lastProvider?: string; lastBaseUrl?: string };
 }): string {
+  // In okta mode the local auth picture is informational only — the actual
+  // credential for the subprocess comes from the relay responder. Show that
+  // up front so the user isn't confused by Console/subscription details that
+  // don't matter for the request that just went out.
+  if (opts.okta?.enabled) {
+    const lines: string[] = ["pi-cas-provider auth (okta relay mode):"];
+    lines.push(`  relay provider:    ${opts.okta.provider ?? "(any responder)"}`);
+    if (opts.okta.lastBaseUrl) {
+      lines.push(`  last relay turn:   ${opts.okta.lastProvider} → ${opts.okta.lastBaseUrl}`);
+    } else {
+      lines.push("  last relay turn:   (none yet this session)");
+    }
+    lines.push(`  CLAUDE_CONFIG_DIR: ${opts.configDir ?? "(default ~/.claude)"}`);
+    lines.push(`  api key override:  ${opts.apiKeyOverride ? "PI_CAS_API_KEY set (ignored in okta mode)" : "no"}`);
+    lines.push("");
+    lines.push("Subprocess credential comes from the relay (x-api-key) — local");
+    lines.push("Claude Code auth (api_key / Console managed key / subscription) is");
+    lines.push("bypassed. The local `extra usage` flag in ~/.claude.json doesn't");
+    lines.push("apply; the relay's upstream org controls fast-mode entitlement.");
+    lines.push("");
+    lines.push("Toggle with /cas-okta off to fall back to local auth.");
+    return lines.join("\n");
+  }
+
   const mode = classifyBilling(s);
   const lines: string[] = ["pi-cas-provider auth:"];
   lines.push(`  logged in:        ${s.loggedIn ? "yes" : "no"}`);

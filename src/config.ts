@@ -39,6 +39,22 @@ export interface ProviderConfig {
   lastFastModeState?: "off" | "cooldown" | "on";
   /** Model id from the most recent request, for /cas-status context. */
   lastModel?: string;
+  /**
+   * Okta-routed relay mode. When enabled, the streamSimple path asks the pi
+   * event bus for an `{ baseUrl, accessToken }` pair before each turn and
+   * routes the subprocess through that relay instead of the user's local
+   * Claude Code auth. See src/relay.ts for the contract.
+   */
+  oktaEnabled: boolean;
+  /**
+   * Optional pin: when set, only the named relay responder is acceptable
+   * (e.g. "hawk"). Absent / empty string means "first responder wins".
+   */
+  oktaProvider?: string;
+  /** Provider name from the most recent successful relay turn, for /cas-status. */
+  lastOktaProvider?: string;
+  /** Base URL from the most recent successful relay turn, for /cas-status. */
+  lastOktaBaseUrl?: string;
 }
 
 /**
@@ -67,6 +83,14 @@ export function createDefaultConfig(): ProviderConfig {
     configDirOverride: process.env.PI_CAS_CLAUDE_CONFIG_DIR,
     apiKeyOverride: process.env.PI_CAS_API_KEY,
     baseUrlOverride: process.env.PI_CAS_BASE_URL,
+    // Okta-relay knobs come purely from the persisted state file. No env-var
+    // override on purpose: this is a deliberate "route my traffic differently"
+    // setting, not a per-launch convenience like PI_CAS_FAST_MODE.
+    oktaEnabled: persisted.okta?.enabled === true,
+    oktaProvider:
+      typeof persisted.okta?.provider === "string" && persisted.okta.provider.trim() !== ""
+        ? persisted.okta.provider.trim()
+        : undefined,
     sdkSessionIds: new Map(),
   };
 }

@@ -38,15 +38,22 @@ import {
   PROJECT_KEY,
 } from "./config.js";
 import { loadState, saveState, statePath } from "./persistence.js";
+import { requestRelay, type RelayConfig } from "./relay.js";
 
 /** Top-level entry called by index.ts. */
 export function registerProvider(pi: ExtensionAPI): void {
-  // Auth banner
-  const auth = getAuthStatus();
-  console.error(`[pi-cas] ${formatAuthBanner(auth)}`);
-
   // Module-level config; slash commands mutate this.
+  // We construct config before printing the auth banner so okta mode (read
+  // from pi-cas.json) can short-circuit the local-auth classification, which
+  // is misleading when the subprocess is going through a relay anyway.
   const config: ProviderConfig = createDefaultConfig();
+
+  const auth = getAuthStatus();
+  console.error(
+    `[pi-cas] ${formatAuthBanner(auth, {
+      okta: { enabled: config.oktaEnabled, provider: config.oktaProvider },
+    })}`,
+  );
   if (config.fastMode) {
     const env = process.env.PI_CAS_FAST_MODE;
     const source =
@@ -63,6 +70,13 @@ export function registerProvider(pi: ExtensionAPI): void {
   }
   if (config.baseUrlOverride) {
     console.error(`[pi-cas] ANTHROPIC_BASE_URL override: ${config.baseUrlOverride}`);
+  }
+  if (config.oktaEnabled) {
+    const who = config.oktaProvider ? `provider=${config.oktaProvider}` : "any responder";
+    console.error(
+      `[pi-cas] okta relay mode ON (${who}) — bypassing local Claude Code auth, ` +
+        `routing subprocess through pi-cas:relay-request responder`,
+    );
   }
 
   // Badge: emits `pi-cas:fast-mode` events + owns the `pi-cas-fast` status
@@ -103,13 +117,14 @@ export function registerProvider(pi: ExtensionAPI): void {
     api: PROVIDER_ID as any,
     models,
     streamSimple: (model, context, options) =>
-      streamViaSDK(model, context as Context, options, config, badge),
+      streamViaSDK(pi, model, context as Context, options, config, badge),
   });
 }
 
 /* ----------------------------- streamSimple ----------------------------- */
 
 function streamViaSDK(
+  pi: ExtensionAPI,
   model: Model<any>,
   context: Context,
   options: SimpleStreamOptions | undefined,
@@ -148,14 +163,73 @@ function streamViaSDK(
     const fastModeRequested = config.fastMode && modelSupportsFastMode(model.id);
     const fastFrag = buildFastModeOptions(fastModeRequested, model.id);
 
+    // 3b. Resolve okta-routed relay endpoint (if enabled). We do this BEFORE
+    // building env so we can fail fast with a clear error if the responder
+    // is missing or its refresh failed — better than spawning the subprocess
+    // and getting a confusing 401 downstream.
+    let relay: RelayConfig | undefined;
+    if (config.oktaEnabled) {
+      try {
+        relay = await requestRelay(pi, {
+          preferredProvider: config.oktaProvider,
+          timeoutMs: 8000,
+        });
+        config.lastOktaProvider = relay.provider;
+        config.lastOktaBaseUrl = relay.baseUrl;
+        if (DEBUG) {
+          console.error(
+            `[pi-cas/debug] okta relay resolved via "${relay.provider}" → ${relay.baseUrl}` +
+              ` (token len=${relay.accessToken.length})`,
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const out: any = {
+          role: "assistant",
+          content: [],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: {
+            input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "error",
+          errorMessage:
+            `pi-cas okta mode is on but the relay request failed: ${msg}. ` +
+            "Run `/cas-okta off` to disable, or fix the responder " +
+            "(`/login <provider>` outside pi).",
+          timestamp: Date.now(),
+        };
+        stream.push({ type: "error", reason: "error", error: out } as any);
+        stream.end();
+        return;
+      }
+    }
+
     // 4. Build the subprocess env.
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
       if (typeof v === "string") env[k] = v;
     }
     if (config.configDirOverride) env.CLAUDE_CONFIG_DIR = config.configDirOverride;
-    if (config.apiKeyOverride) env.ANTHROPIC_API_KEY = config.apiKeyOverride;
-    if (config.baseUrlOverride) env.ANTHROPIC_BASE_URL = config.baseUrlOverride;
+    // Okta relay wins over PI_CAS_API_KEY / PI_CAS_BASE_URL on purpose: if the
+    // user explicitly enabled okta mode, that's the auth path they want, and
+    // mixing a stale env-var key in would confuse the claude binary.
+    if (relay) {
+      env.ANTHROPIC_API_KEY = relay.accessToken;
+      env.ANTHROPIC_BASE_URL = relay.baseUrl;
+      // The bundled claude binary picks up Bearer auth from these and would
+      // send both `Authorization: Bearer ...` and `x-api-key: ...`. The relay
+      // (e.g. middleman) only accepts x-api-key; sending Authorization
+      // alongside causes a 401. Strip them so x-api-key=relay-token is the
+      // sole credential.
+      delete env.ANTHROPIC_AUTH_TOKEN;
+      delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    } else {
+      if (config.apiKeyOverride) env.ANTHROPIC_API_KEY = config.apiKeyOverride;
+      if (config.baseUrlOverride) env.ANTHROPIC_BASE_URL = config.baseUrlOverride;
+    }
     if (fastFrag.env) Object.assign(env, fastFrag.env);
 
     // 5. Hook up abort.
@@ -336,6 +410,12 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
       const text = formatAuthDetails(auth, {
         configDir: config.configDirOverride,
         apiKeyOverride: !!config.apiKeyOverride,
+        okta: {
+          enabled: config.oktaEnabled,
+          provider: config.oktaProvider,
+          lastProvider: config.lastOktaProvider,
+          lastBaseUrl: config.lastOktaBaseUrl,
+        },
       });
       emit(pi, ctx, "pi-cas/auth", text);
     },
@@ -400,6 +480,85 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
     },
   });
 
+  pi.registerCommand("cas-okta", {
+    description: "Route pi-cas through an Okta-OAuth relay (on/off/status [provider])",
+    getArgumentCompletions: (prefix) => {
+      const opts = ["on", "off", "status"];
+      const matches = opts.filter((o) => o.startsWith(prefix.toLowerCase()));
+      return matches.length ? matches.map((o) => ({ value: o, label: o })) : null;
+    },
+    handler: async (args: string, ctx: any) => {
+      // Accept: `on`, `off`, `status`, `on <provider>`, `<provider>` (sugar for `on <provider>`).
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const first = (parts[0] ?? "status").toLowerCase();
+      let action: "on" | "off" | "status";
+      let provider: string | undefined;
+      if (first === "on") {
+        action = "on";
+        provider = parts[1];
+      } else if (first === "off") {
+        action = "off";
+      } else if (first === "status") {
+        action = "status";
+      } else {
+        // Bare provider name — treat as `on <provider>`. Friendly shortcut.
+        action = "on";
+        provider = first;
+      }
+
+      let changed = false;
+      if (action === "on") {
+        if (!config.oktaEnabled || config.oktaProvider !== provider) changed = true;
+        config.oktaEnabled = true;
+        config.oktaProvider = provider;
+      } else if (action === "off") {
+        if (config.oktaEnabled) changed = true;
+        config.oktaEnabled = false;
+        // Keep the provider pin so toggling back on remembers it.
+      }
+      if (changed) {
+        saveState({
+          okta: {
+            enabled: config.oktaEnabled,
+            ...(config.oktaProvider ? { provider: config.oktaProvider } : {}),
+          },
+        });
+      }
+
+      const stateLine = config.oktaEnabled
+        ? `pi-cas okta relay: ON${
+            config.oktaProvider ? ` (provider pinned to "${config.oktaProvider}")` : " (any responder wins)"
+          }`
+        : "pi-cas okta relay: off";
+      const heading = changed ? `→ ${stateLine}` : stateLine;
+
+      const detail: string[] = [heading];
+      if (config.oktaEnabled) {
+        detail.push(
+          "  pi-cas asks pi.events for a relay endpoint before each turn and",
+          "  routes the bundled `claude` subprocess through it. Local Claude",
+          "  Code auth (api_key / Console managed key) is bypassed.",
+        );
+        if (config.lastOktaBaseUrl) {
+          detail.push(`  last successful relay: ${config.lastOktaProvider} → ${config.lastOktaBaseUrl}`);
+        }
+      } else {
+        detail.push(
+          "  pi-cas uses local Claude Code auth (whatever `claude auth status` reports).",
+        );
+      }
+      detail.push(`  Persisted to ${statePath()}.`);
+      if (action === "on") {
+        detail.push(
+          "  Requires a responder extension loaded in pi (e.g. pi-hawk-provider)",
+          "  listening on `pi-cas:relay-request`. /cas-status shows the last turn.",
+        );
+      }
+
+      emit(pi, ctx, "pi-cas/okta", detail.join("\n"));
+    },
+  });
+
   pi.registerCommand("cas-status", {
     description: "Show pi-cas-provider configuration and last-turn ground truth",
     handler: async (_args: string, ctx: any) => {
@@ -416,10 +575,21 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
               ? "cooldown — fast-mode pool depleted, API throttling"
               : `off — API did not engage fast mode on last turn${config.lastModel ? ` (${config.lastModel})` : ""}`;
 
+      const oktaLabel = config.oktaEnabled
+        ? `on${config.oktaProvider ? ` (provider=${config.oktaProvider})` : " (any responder)"}`
+        : "off";
+      const oktaLastLabel = config.lastOktaBaseUrl
+        ? `${config.lastOktaProvider ?? "?"} → ${config.lastOktaBaseUrl}`
+        : config.oktaEnabled
+          ? "(no successful relay turn yet this session)"
+          : "—";
+
       const lines = [
         "pi-cas-provider status:",
         `  fast mode (intent):  ${intent}`,
         `  fast mode (actual):  ${realityLabel}`,
+        `  okta relay:          ${oktaLabel}`,
+        `  okta last turn:      ${oktaLastLabel}`,
         `  config dir:          ${config.configDirOverride ?? "(default ~/.claude)"}`,
         `  api key override:    ${config.apiKeyOverride ? "PI_CAS_API_KEY set" : "no"}`,
         `  base url override:   ${config.baseUrlOverride ?? "(none — SDK default or ANTHROPIC_BASE_URL)"}`,
@@ -427,12 +597,18 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
         `  persisted state:     ${statePath()}`,
       ];
 
-      // Helpful hint when intent and reality disagree.
+      // Helpful hint when intent and reality disagree. Skip the extra-usage
+      // note in okta mode — the local ~/.claude.json entitlement flag is
+      // irrelevant when traffic is routed through the relay.
       if (config.fastMode && config.lastFastModeState === "off") {
         lines.push("");
         lines.push("Note: you requested fast mode but the API returned off on the last turn.");
         lines.push("  - On Opus 4.6/4.7? Otherwise the setting is silently ignored.");
-        lines.push("  - Does your org have extra-usage enabled? See /cas-auth.");
+        if (!config.oktaEnabled) {
+          lines.push("  - Does your org have extra-usage enabled? See /cas-auth.");
+        } else {
+          lines.push("  - Does the relay have fast-mode entitlement on its upstream Console org?");
+        }
       }
 
       emit(pi, ctx, "pi-cas/status", lines.join("\n"));

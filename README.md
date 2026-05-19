@@ -98,8 +98,104 @@ All optional. Set as environment variables before launching pi.
 | Command | Purpose |
 |---|---|
 | `/cas-auth` | Show auth status, identity, and fast-mode entitlement. |
-| `/cas-fast on` / `off` / `status` | Toggle or inspect fast mode for this pi session. |
+| `/cas-fast on` / `off` / `status` | Toggle or inspect fast mode (persisted). |
+| `/cas-okta on [provider]` / `off` / `status` | Route the subprocess through an Okta-OAuth relay extension (persisted). See below. |
 | `/cas-status` | Show provider configuration and active SDK session count. |
+
+## Okta-OAuth relay mode
+
+pi-cas can route the bundled `claude` subprocess through a separate
+OAuth-managed relay endpoint instead of using your local Claude Code auth.
+This is useful when:
+
+- Your org runs a corporate proxy / middleman in front of `api.anthropic.com`
+  that gates Anthropic access behind Okta (or any OIDC) login.
+- You want to bypass the Console-managed-key refresh hazard (the
+  `Not logged in · Please run /login` failure mode in long pi sessions).
+- You want pi-cas billing to flow through the relay's upstream account
+  rather than your local Claude Code Console org.
+
+### How it works
+
+When `/cas-okta on` is set, pi-cas asks pi's event bus for a relay endpoint
+before each turn:
+
+```
+pi-cas emits  →  pi-cas:relay-request   { requestId, preferredProvider? }
+responder      ←  pi-cas:relay-response  { requestId, ok, provider, baseUrl, accessToken }
+```
+
+The responder is expected to refresh its OAuth token before answering, so
+the `accessToken` is good-to-use immediately. pi-cas then sets in the
+subprocess env:
+
+- `ANTHROPIC_API_KEY = <accessToken>`     — sent as `x-api-key`
+- `ANTHROPIC_BASE_URL = <baseUrl>`
+- (unsets `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` to avoid a
+  conflicting `Authorization: Bearer` header)
+
+The contract is provider-neutral. Any extension can implement it.
+Current known responders:
+
+- [`pi-hawk-provider`](https://github.com/neevparikh/pi-hawk-provider) — routes
+  through METR's middleman with Okta-issued tokens; identifies itself as
+  `hawk` on the bus.
+
+### Pinning a responder
+
+If multiple responders might answer, pin one:
+
+```
+/cas-okta on hawk     # only the responder identifying as "hawk" wins
+/cas-okta on          # first responder wins
+/cas-okta off         # back to local Claude Code auth
+/cas-okta status      # show current state
+```
+
+The pin is persisted to `~/.pi/agent/pi-cas.json` alongside the fast-mode
+preference.
+
+### In okta mode
+
+- `/cas-auth` reports the relay state instead of classifying local auth
+  (api_key / Console OAuth / subscription). The local `extra usage` flag
+  in `~/.claude.json` is irrelevant; fast-mode entitlement lives on the
+  relay's upstream org.
+- Failures (no responder loaded, responder failed to refresh, etc.)
+  produce a clear error on the turn rather than a confusing 401 from
+  the subprocess.
+- The TOS warning about Pro/Max subscription auth doesn't apply —
+  subscription credentials never reach the subprocess in okta mode.
+
+### Implementing a responder
+
+Minimal responder, in any pi extension:
+
+```ts
+pi.events.on("pi-cas:relay-request", (raw) => {
+  const req = raw as { requestId: string; preferredProvider?: string };
+  if (req.preferredProvider && req.preferredProvider !== "my-provider") return;
+  void (async () => {
+    try {
+      const accessToken = await getFreshAccessToken();
+      pi.events.emit("pi-cas:relay-response", {
+        requestId: req.requestId,
+        ok: true,
+        provider: "my-provider",
+        baseUrl: "https://my-relay.example.com/anthropic",
+        accessToken,
+      });
+    } catch (err) {
+      pi.events.emit("pi-cas:relay-response", {
+        requestId: req.requestId,
+        ok: false,
+        provider: "my-provider",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
+});
+```
 
 ## UI: fast-mode badge
 
