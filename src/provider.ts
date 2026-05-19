@@ -27,6 +27,7 @@ import { createPiSessionStore } from "./session-store.js";
 import { composeSystemPrompt } from "./system-prompt.js";
 import { ALLOWED_CC_TOOLS, DISALLOWED_CC_TOOLS } from "./tool-shim.js";
 import { mapEffort } from "./effort.js";
+import { buildThinkingConfig } from "./thinking.js";
 import { buildFastModeOptions, modelSupportsFastMode } from "./settings.js";
 import { createEventBridge } from "./event-bridge.js";
 import { getAuthStatus, formatAuthBanner, formatAuthDetails } from "./auth.js";
@@ -196,6 +197,49 @@ function streamViaSDK(
       console.error(`[pi-cas/debug] transcript=${transcript.length} entries, newUserContent=[${newCT}]`);
     }
 
+    // Diagnostic: log loudly (no DEBUG gate) when newUserContent is empty.
+    // This is the case we're chasing for the "Picking up where I left off"
+    // behavior: when pi-cas yields an empty user turn, the bundled claude
+    // binary substitutes its `(no content)` sentinel, and Opus reads that as
+    // a resume signal. Dumping the last few pi messages here lets us see
+    // *why* pi-cas thought the trailing prompt was empty (was the trailing
+    // turn an assistant? a toolResult with empty content? a user message
+    // with only stripped-out block types?).
+    if (newUserContent.length === 0) {
+      const tail = (context.messages as any[]).slice(-4);
+      const summary = tail.map((m, i) => {
+        const idx = (context.messages as any[]).length - tail.length + i;
+        const role = m.role ?? "?";
+        let kinds: string;
+        let preview: string;
+        if (typeof m.content === "string") {
+          kinds = "string";
+          preview = JSON.stringify(m.content.slice(0, 120));
+        } else if (Array.isArray(m.content)) {
+          kinds = m.content.map((b: any) => b.type ?? "?").join(",") || "(empty array)";
+          const firstText = m.content.find((b: any) => b.type === "text");
+          preview = firstText ? JSON.stringify((firstText.text ?? "").slice(0, 120)) : "";
+        } else {
+          kinds = `?(${typeof m.content})`;
+          preview = "";
+        }
+        const extras: string[] = [];
+        if (m.role === "toolResult") {
+          extras.push(`tool=${m.toolName ?? "?"}`);
+          if (m.isError) extras.push("isError=true");
+        }
+        return `    [${idx}] role=${role} kinds=[${kinds}]${
+          extras.length ? ` ${extras.join(" ")}` : ""
+        }${preview ? ` text=${preview}` : ""}`;
+      });
+      console.error(
+        `[pi-cas] WARNING newUserContent is EMPTY — pi-cas will send an empty user turn ` +
+          `which the claude subprocess maps to "(no content)", triggering ` +
+          `"Picking up where I left off" behavior. Last ${tail.length} pi messages ` +
+          `(of ${(context.messages as any[]).length} total):\n${summary.join("\n")}`,
+      );
+    }
+
     // 3. Resolve fast-mode/effort fragments.
     const fastModeRequested = config.fastMode && modelSupportsFastMode(model.id);
     const fastFrag = buildFastModeOptions(fastModeRequested, model.id);
@@ -334,6 +378,13 @@ function streamViaSDK(
       env,
       ...fastFrag.extraArgs ? { extraArgs: fastFrag.extraArgs } : {},
       effort: mapEffort(options?.reasoning),
+      // Without this the SDK never passes `--thinking-display` to the bundled
+      // `claude` subprocess, so the API never emits summarized thinking blocks
+      // even on Opus 4.6/4.7. The CLI's `showThinkingSummaries` settings.json
+      // fallback can't rescue us either: `settingSources: []` above tells the
+      // CLI not to load user/project settings, and our `extraArgs.settings`
+      // blob (from buildFastModeOptions) doesn't include it.
+      thinking: buildThinkingConfig(model, options?.reasoning, options?.thinkingBudgets),
     };
 
     const bridge = createEventBridge(stream, model);
