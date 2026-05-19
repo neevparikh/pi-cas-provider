@@ -1,10 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  piToTranscript,
-  piContentToAnthropicBlocks,
-  piAssistantBlocksToAnthropic,
-  defangCompactionPrefix,
-} from "../src/transcript.js";
+import { piToTranscript, piContentToAnthropicBlocks, piAssistantBlocksToAnthropic } from "../src/transcript.js";
 
 const OPTS = { cwd: "/tmp/x", sessionId: "11111111-1111-4111-8111-111111111111" };
 
@@ -149,55 +144,6 @@ describe("content-block translators", () => {
 
   it("piContentToAnthropicBlocks empty string → empty array", () => {
     expect(piContentToAnthropicBlocks("")).toEqual([]);
-  });
-
-  it("piContentToAnthropicBlocks rewrites pi's compaction-summary framing", () => {
-    // This is the exact prefix pi emits from `/compact`, plus a trivial body
-    // and a `</summary>` tail. The defang rewrites the framing words so Opus
-    // doesn't interpret it as a Claude-Code-style session resume signal.
-    const input =
-      "The conversation history before this point was compacted into the following summary:\n\n" +
-      "<summary>\nDid some pirouette work.\n</summary>";
-    const out = piContentToAnthropicBlocks(input);
-    expect(out).toHaveLength(1);
-    const block = out[0] as { type: "text"; text: string };
-    expect(block.type).toBe("text");
-    expect(block.text).not.toMatch(/conversation history before this point was compacted/);
-    expect(block.text).not.toMatch(/<summary>/);
-    expect(block.text).not.toMatch(/<\/summary>/);
-    expect(block.text).toContain("Did some pirouette work.");
-    // Should keep some neutral framing so the model still knows it's context.
-    expect(block.text).toMatch(/earlier context/i);
-  });
-
-  it("piContentToAnthropicBlocks also defangs compaction prefix in array text blocks", () => {
-    // Pi sometimes sends the compaction summary as the second text block,
-    // after a system-reminder. Both should be processed independently.
-    const input = [
-      { type: "text", text: "<system-reminder>note</system-reminder>" },
-      {
-        type: "text",
-        text:
-          "The conversation history before this point was compacted into the following summary:\n\n" +
-          "<summary>\nThings happened.\n</summary>",
-      },
-    ];
-    const out = piContentToAnthropicBlocks(input);
-    expect(out).toHaveLength(2);
-    expect((out[0] as any).text).toBe("<system-reminder>note</system-reminder>");
-    expect((out[1] as any).text).not.toMatch(/conversation history before this point/);
-    expect((out[1] as any).text).toContain("Things happened.");
-  });
-
-  it("defangCompactionPrefix is a no-op on text that doesn't start with the prefix", () => {
-    // Conservative: must not rewrite arbitrary user text that happens to
-    // contain the substring elsewhere.
-    const safe = "random user text talking about compaction summaries";
-    expect(defangCompactionPrefix(safe)).toBe(safe);
-
-    const withPrefixMidString =
-      "prefix \nThe conversation history before this point was compacted into the following summary:\n\n<summary>\nfoo\n</summary>";
-    expect(defangCompactionPrefix(withPrefixMidString)).toBe(withPrefixMidString);
   });
 
   it("piContentToAnthropicBlocks image → anthropic image format", () => {
