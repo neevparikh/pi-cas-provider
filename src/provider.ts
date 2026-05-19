@@ -197,46 +197,17 @@ function streamViaSDK(
       console.error(`[pi-cas/debug] transcript=${transcript.length} entries, newUserContent=[${newCT}]`);
     }
 
-    // Diagnostic: log loudly (no DEBUG gate) when newUserContent is empty.
-    // This is the case we're chasing for the "Picking up where I left off"
-    // behavior: when pi-cas yields an empty user turn, the bundled claude
-    // binary substitutes its `(no content)` sentinel, and Opus reads that as
-    // a resume signal. Dumping the last few pi messages here lets us see
-    // *why* pi-cas thought the trailing prompt was empty (was the trailing
-    // turn an assistant? a toolResult with empty content? a user message
-    // with only stripped-out block types?).
-    if (newUserContent.length === 0) {
-      const tail = (context.messages as any[]).slice(-4);
-      const summary = tail.map((m, i) => {
-        const idx = (context.messages as any[]).length - tail.length + i;
-        const role = m.role ?? "?";
-        let kinds: string;
-        let preview: string;
-        if (typeof m.content === "string") {
-          kinds = "string";
-          preview = JSON.stringify(m.content.slice(0, 120));
-        } else if (Array.isArray(m.content)) {
-          kinds = m.content.map((b: any) => b.type ?? "?").join(",") || "(empty array)";
-          const firstText = m.content.find((b: any) => b.type === "text");
-          preview = firstText ? JSON.stringify((firstText.text ?? "").slice(0, 120)) : "";
-        } else {
-          kinds = `?(${typeof m.content})`;
-          preview = "";
-        }
-        const extras: string[] = [];
-        if (m.role === "toolResult") {
-          extras.push(`tool=${m.toolName ?? "?"}`);
-          if (m.isError) extras.push("isError=true");
-        }
-        return `    [${idx}] role=${role} kinds=[${kinds}]${
-          extras.length ? ` ${extras.join(" ")}` : ""
-        }${preview ? ` text=${preview}` : ""}`;
-      });
+    // Empty newUserContent is an expected case after the transcript.ts fix:
+    // it means pi just ran a tool and the matching tool_result was paired
+    // into the historic transcript, leaving no genuinely-new user content
+    // for this turn.  promptGen yields a `.` continuation hint in that case
+    // (see comment there for rationale).  We log only in DEBUG mode now —
+    // this is no longer the bug-signal it once was.
+    if (DEBUG && newUserContent.length === 0) {
       console.error(
-        `[pi-cas] WARNING newUserContent is EMPTY — pi-cas will send an empty user turn ` +
-          `which the claude subprocess maps to "(no content)", triggering ` +
-          `"Picking up where I left off" behavior. Last ${tail.length} pi messages ` +
-          `(of ${(context.messages as any[]).length} total):\n${summary.join("\n")}`,
+        `[pi-cas/debug] newUserContent empty (tool-result-only continuation — ` +
+          `historic transcript has the paired tool_result folded in, promptGen ` +
+          `will yield a benign continuation marker)`,
       );
     }
 
@@ -390,13 +361,36 @@ function streamViaSDK(
     const bridge = createEventBridge(stream, model);
 
     // 8. Prompt generator — yields the new user turn's content.
+    //
+    // Continuation hint when newUserContent is empty (tool-result-only
+    // continuation case):
+    //
+    // After piToTranscript's fix for the orphan-prune bug, the transcript
+    // ends with a synthetic assistant marker ("No response requested.").
+    // When there's no genuinely-new user content — the common case where
+    // pi ran a tool and just wants the model's follow-up — yielding empty
+    // content makes the bundled `claude` binary substitute its `(no
+    // content)` placeholder, and the model treats the conversation as
+    // "finished" ("I'm here if you need anything else") rather than
+    // responding to the tool_result that's earlier in the buffer.
+    //
+    // A substantive continuation hint nudges the model to actually
+    // respond to the recent tool_result. Empirically verified during
+    // design probes: with this hint, the model produces the expected
+    // contextual response ("The command printed: ...") rather than a
+    // generic acknowledgement.
+    //
+    // The hint is visible only to the model — it never appears in pi's
+    // history (pi-cas's promptGen output isn't persisted on pi's side),
+    // so users don't see it.
+    const CONTINUATION_HINT = "Continue based on the tool result above.";
     async function* promptGen() {
       yield {
         type: "user" as const,
         message: {
           role: "user" as const,
           content: newUserContent.length === 0
-            ? ""
+            ? CONTINUATION_HINT
             : (newUserContent as any),
         },
         parent_tool_use_id: null,

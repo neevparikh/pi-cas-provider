@@ -7,15 +7,27 @@
  * subprocess resumes from. No flattening, no labelled-text hack — the model
  * sees a real conversation with real tool_use / tool_result pairings.
  *
- * Splitting rule
- * --------------
- *   transcript  = messages strictly before the new user-side turn
- *   prompt      = the new user-side turn that triggered this streamSimple call
+ * Splitting rule (revised to fix "Picking up where I left off" injection)
+ * ----------------------------------------------------------------------
+ * Naive split would be: "everything up to last assistant in historic;
+ * everything after in new prompt."  That made every tool-use turn produce a
+ * disk transcript ending in `assistant(tool_use)` with the matching
+ * `tool_result` only arriving over the SDK's new-prompt channel.  The bundled
+ * `claude` binary's resume normalizer then
+ *   1. orphan-pruned the dangling assistant (`iO6`), and
+ *   2. detected the buffer as `interrupted_turn` (`Xg5`), splicing in two
+ *      synthetic placeholders: `user("Continue from where you left off.")`
+ *      and `assistant("No response requested.")`.
+ * The model then opened replies with "Picking up where I left off…" and the
+ * conversation degraded into a `(no content)` feedback loop.
  *
- * "User-side" means a contiguous trailing run of UserMessage and/or
- * ToolResultMessage entries — pi calls streamSimple either because the user
- * typed something or because pi just executed tools and needs the model to
- * continue. In both cases the trailing items become the new prompt.
+ * Fix: include trailing `tool_result` entries that pair with the last
+ * historic assistant's `tool_use`s INSIDE the historic transcript, then
+ * append a synthetic assistant marker so the disk JSONL ends in an assistant
+ * message.  The new prompt then carries only genuinely-new user-side content
+ * (typed text, images), often empty for tool-result-only continuation turns.
+ *
+ * See writeups/write_up.md for the full design and empirical validation.
  */
 
 import { randomUUID } from "node:crypto";
@@ -70,14 +82,27 @@ export interface BuildTranscriptOpts {
 
 /**
  * Build the transcript-plus-new-prompt split from a pi messages array.
+ *
+ * Algorithm:
+ *   1. Find the last assistant turn.
+ *   2. Collect the set of `tool_use` IDs on that assistant turn (if any).
+ *   3. Split trailing messages (everything after the last assistant) into:
+ *      - paired tool_results (those whose `toolCallId` is in the set) → fold
+ *        into the historic transcript right after the assistant
+ *      - leftover (user text, unpaired tool_results) → newUserContent
+ *   4. Append a synthetic assistant marker as the very last historic entry.
+ *
+ * The synthetic marker uses the bundled binary's own internal sentinel
+ * (`model: "<synthetic>"`, text `"No response requested."`).  Various places
+ * in the binary already special-case this shape (usage tracking excludes it,
+ * certain filters strip it, etc.) so it plays nicely with the binary's
+ * resume normalizer instead of confusing it.
  */
 export function piToTranscript(
   messages: readonly PiMessage[],
   opts: BuildTranscriptOpts,
 ): BuildTranscriptResult {
-  // Where does the trailing "new user turn" begin? It's the index just after
-  // the last assistant message. If there is no assistant message yet, the
-  // trailing run is the entire history (and the transcript is empty).
+  // Step 1: locate the last assistant turn.
   let lastAssistantIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "assistant") {
@@ -85,12 +110,130 @@ export function piToTranscript(
       break;
     }
   }
-  const historic = messages.slice(0, lastAssistantIdx + 1);
-  const trailing = messages.slice(lastAssistantIdx + 1);
 
-  const newUserContent = buildNewUserContent(trailing);
-  const transcript = buildHistoricEntries(historic, opts);
-  return { transcript, newUserContent };
+  // First-turn case: no assistant yet — transcript is empty, the entire
+  // history is the new prompt.  No synthetic marker (nothing to ward off the
+  // normalizer from).
+  if (lastAssistantIdx === -1) {
+    return {
+      transcript: [],
+      newUserContent: buildNewUserContent(messages),
+    };
+  }
+
+  // Step 2: collect tool_use ids on the last assistant turn (after our shim
+  // would have mapped names — see piAssistantBlocksToAnthropic).  Pi stores
+  // tool calls under the `toolCall` content type with the pre-shim id
+  // unchanged, so the ids match the tool_result.toolCallId values.
+  const lastAsst = messages[lastAssistantIdx];
+  const lastAsstToolUseIds = new Set<string>();
+  if (lastAsst.role === "assistant" && Array.isArray(lastAsst.content)) {
+    for (const b of lastAsst.content) {
+      if (b.type === "toolCall" && typeof (b as any).id === "string") {
+        lastAsstToolUseIds.add((b as any).id);
+      }
+    }
+  }
+
+  // Step 3: split trailing messages into (a) tool_results that pair with the
+  // last assistant turn vs (b) everything else.
+  //
+  // We accept tool_results in any order within the trailing run as long as
+  // each one's toolCallId matches a tool_use id from the last assistant.
+  // Once we encounter a non-toolResult or an unpaired toolResult, we stop
+  // pairing — anything after is genuine new content (user text, etc.).
+  const trailing = messages.slice(lastAssistantIdx + 1);
+  const pairedToolResults: PiMessage[] = [];
+  const leftover: PiMessage[] = [];
+  let stillPairing = lastAsstToolUseIds.size > 0;
+  for (const m of trailing) {
+    if (stillPairing && m.role === "toolResult" && lastAsstToolUseIds.has(m.toolCallId)) {
+      pairedToolResults.push(m);
+      continue;
+    }
+    stillPairing = false;
+    leftover.push(m);
+  }
+
+  // Step 4: build historic = [..., last_assistant_turn, paired_tool_results, synth_marker]
+  const historicSourceMessages = [
+    ...messages.slice(0, lastAssistantIdx + 1),
+    ...pairedToolResults,
+  ];
+  const historicEntries = buildHistoricEntries(historicSourceMessages, opts);
+  appendSynthAssistantMarker(historicEntries, opts);
+
+  return {
+    transcript: historicEntries,
+    newUserContent: buildNewUserContent(leftover),
+  };
+}
+
+/* ---------------------- synth-asst marker ---------------------- */
+
+/**
+ * The synthetic assistant marker that goes at the end of every non-empty
+ * historic transcript.
+ *
+ * The exact strings here are the bundled `claude` binary's own internal
+ * sentinels:
+ *   - `model: "<synthetic>"`  (the binary's `jG` constant)
+ *   - `text: "No response requested."`  (the binary's `TGH` constant)
+ *
+ * Various filters in the binary already special-case these (usage tracking
+ * excludes them, certain views strip them, etc.), so our marker is
+ * indistinguishable from a marker the binary itself would synthesize during
+ * its own resume-recovery flow.
+ *
+ * Why we need this entry at the end of the transcript:
+ *
+ *   `gG8` (the resume normalizer) does roughly:
+ *     1. iO6 — drop assistant turns whose tool_uses are ALL orphans (no
+ *        matching tool_result in the buffer).  We avoid this by folding
+ *        trailing paired tool_results into the historic transcript, so no
+ *        assistant tool_use is orphan on disk.
+ *     2. Xg5 — if the buffer's last non-system/non-progress entry is a
+ *        user with content[0].type === "tool_result", classify as
+ *        `interrupted_turn` and splice in `user("Continue from where you
+ *        left off.")`.  We avoid this by making the last entry an assistant
+ *        — our synth marker.
+ *     3. Unconditional TGH splice — if the last entry is still a user,
+ *        splice in `assistant("No response requested.")` after.  Our synth
+ *        marker makes the last entry an assistant, so this also doesn't fire.
+ */
+const SYNTH_ASSISTANT_TEXT = "No response requested.";
+const SYNTH_ASSISTANT_MODEL = "<synthetic>";
+
+function appendSynthAssistantMarker(
+  entries: TranscriptEntry[],
+  opts: BuildTranscriptOpts,
+): void {
+  if (entries.length === 0) return; // No history → no marker needed.
+  const last = entries[entries.length - 1];
+  const ts = new Date().toISOString();
+  const uuid = randomUUID();
+  entries.push({
+    isSidechain: false,
+    userType: "external",
+    cwd: opts.cwd,
+    sessionId: opts.sessionId,
+    version: opts.version ?? "2.1.143",
+    gitBranch: opts.gitBranch ?? "",
+    parentUuid: last.uuid,
+    type: "assistant",
+    uuid,
+    timestamp: ts,
+    message: {
+      model: SYNTH_ASSISTANT_MODEL,
+      id: `msg_${randomUUID().replace(/-/g, "")}`,
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: SYNTH_ASSISTANT_TEXT }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  });
 }
 
 /* ---------------------- new-prompt content assembly ---------------------- */
