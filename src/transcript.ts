@@ -208,17 +208,66 @@ function buildHistoricEntries(
 
 /* ---------------------- content-block translators ---------------------- */
 
+/**
+ * Defang pi's compaction-summary framing so Opus doesn't interpret it as a
+ * Claude Code session-resume signal.
+ *
+ * Background
+ * ----------
+ * Pi's `/compact` replaces conversation history with a single message whose
+ * text starts with this exact prefix (defined in pi's core/messages.ts):
+ *
+ *   "The conversation history before this point was compacted into the
+ *    following summary:\n\n<summary>\n...\n</summary>"
+ *
+ * Claude Code uses the *same* phrasing for its own auto-compaction, and Opus
+ * (especially in Claude Code mode, which pi-cas opts into via beta headers)
+ * has clearly learned to recognize the pattern: when it sees a first user
+ * message of this shape, it acts like a resumed session and starts replies
+ * with "Picking back up…" / "Picking up where we left off…" boilerplate.
+ *
+ * Empirically observed in /tmp/pi-cas-http-pirouette.jsonl (May 2026): 1300+
+ * message conversations whose first user message had the compaction prefix
+ * consistently produced "Picking up…" assistant prefixes.
+ *
+ * Fix
+ * ---
+ * Replace the prefix + `<summary>` tag with neutral framing. We keep the
+ * summary content (it's genuinely useful context) but strip the resume-flavor
+ * wording and the specific tag name Opus seems to key off of.
+ *
+ * We do NOT touch other providers' rendering of this message — only pi-cas's
+ * Anthropic wire format — because the resume-flavor recognition is
+ * Claude-specific.
+ */
+const COMPACTION_PREFIX_RE =
+  /^The conversation history before this point was compacted into the following summary:\n\n<summary>\n/;
+const COMPACTION_SUFFIX_RE = /\n<\/summary>\s*$/;
+const NEUTRAL_PREFIX = "[Earlier context in this conversation, summarized below.]\n\n";
+const NEUTRAL_SUFFIX = "";
+
+export function defangCompactionPrefix(text: string): string {
+  if (!COMPACTION_PREFIX_RE.test(text)) return text;
+  // Replace opening tag + framing…
+  let out = text.replace(COMPACTION_PREFIX_RE, NEUTRAL_PREFIX);
+  // …and the closing </summary> if present. Tolerate trailing whitespace.
+  out = out.replace(COMPACTION_SUFFIX_RE, NEUTRAL_SUFFIX);
+  return out;
+}
+
 /** Pi user/text content → Anthropic blocks. Used for user messages.
- *  Empty text blocks are dropped — Anthropic API rejects them. */
+ *  Empty text blocks are dropped — Anthropic API rejects them.
+ *  Compaction-prefix wording is rewritten via `defangCompactionPrefix`. */
 export function piContentToAnthropicBlocks(content: PiContent): AnthropicContentBlock[] {
   if (typeof content === "string") {
-    return content.length > 0 ? [{ type: "text", text: content }] : [];
+    const t = defangCompactionPrefix(content);
+    return t.length > 0 ? [{ type: "text", text: t }] : [];
   }
   if (!Array.isArray(content)) return [];
   const blocks: AnthropicContentBlock[] = [];
   for (const b of content) {
     if (b.type === "text") {
-      const t = b.text ?? "";
+      const t = defangCompactionPrefix(b.text ?? "");
       if (t.length > 0) blocks.push({ type: "text", text: t });
     } else if (b.type === "image" && typeof b.data === "string" && typeof b.mimeType === "string") {
       blocks.push({
