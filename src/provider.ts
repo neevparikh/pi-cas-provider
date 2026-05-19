@@ -488,28 +488,33 @@ function streamViaSDK(
 /**
  * Output helper: emit text to the user from a slash command.
  *
- * For short single-line status, `ctx.ui.notify` is ideal (transient banner).
- * For multi-line content we want it to land in the chat scrollback so the user
- * can read and reference it. Pi exposes `pi.sendMessage` for that — sending a
- * `customType` with a `display.kind: "text"` shows the text inline in the
- * session and persists in the transcript.
+ * Always uses `ctx.ui.notify(text, kind)`. We deliberately do NOT use
+ * `pi.sendMessage(...)` for slash-command output: pi's `convertToLlm()`
+ * unconditionally transforms `role: "custom"` messages into `role: "user"`
+ * text messages that get sent to the model on every subsequent turn. So a
+ * three-line `/cas-status` reply would silently pollute LLM context with
+ * pi-cas plumbing text — the model would see things like "pi-cas fast mode:
+ * ON ... $30/$150 per MTok ..." as if the user had said them. The `display`
+ * flag on `sendMessage` only controls TUI rendering, not LLM inclusion (the
+ * docs are slightly misleading here — verified in messages.js).
  *
- * The previous implementation called `ctx.sendMessage?.(...)` which silently
- * no-op'd: `sendMessage` does NOT exist on `ExtensionCommandContext` (only on
- * the top-level `ExtensionAPI`), and the optional-chain hid the missing method.
+ * `appendEntry()` was tempting (it explicitly skips LLM context) but it has
+ * no rendering path in the chat scrollback either, so it's strictly worse
+ * than notify for our use case.
+ *
+ * notify handles multi-line text fine; pi renders it as a bordered info/
+ * warning/error block in the TUI. The `customType` parameter is retained
+ * in the signature for caller-side clarity but is no longer used — notify
+ * doesn't take a type label.
  */
-function emit(pi: ExtensionAPI, ctx: any, customType: string, text: string): void {
-  // Short single-line: a notify banner works well.
-  if (!text.includes("\n")) {
-    ctx.ui.notify(text, "info");
-    return;
-  }
-  // Multi-line: send a custom message into the chat scrollback.
-  pi.sendMessage({
-    customType,
-    content: text,
-    display: true,
-  });
+function emit(
+  _pi: ExtensionAPI,
+  ctx: any,
+  _customType: string,
+  text: string,
+  kind: "info" | "warning" | "error" = "info",
+): void {
+  ctx.ui.notify(text, kind);
 }
 
 function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: FastModeBadge): void {
