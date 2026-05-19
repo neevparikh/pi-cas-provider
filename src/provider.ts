@@ -210,13 +210,13 @@ function streamViaSDK(
     }
 
     // 2. Build transcript + new prompt content.
-    const { transcript, newUserContent } = piToTranscript(context.messages as any[], {
-      cwd,
-      sessionId: sdkSessionId,
-    });
+    const { transcript, newUserContent, hasPairedToolResults } = piToTranscript(
+      context.messages as any[],
+      { cwd, sessionId: sdkSessionId },
+    );
     if (DEBUG) {
       const newCT = newUserContent.map((b: any) => b.type).join(",");
-      console.error(`[pi-cas/debug] transcript=${transcript.length} entries, newUserContent=[${newCT}]`);
+      console.error(`[pi-cas/debug] transcript=${transcript.length} entries, newUserContent=[${newCT}], hasPairedToolResults=${hasPairedToolResults}`);
     }
 
     // Empty newUserContent is an expected case after the transcript.ts fix:
@@ -383,15 +383,27 @@ function streamViaSDK(
     const bridge = createEventBridge(stream, model);
 
     // 8. Prompt generator — yields the new user turn's content.
-    // See `CONTINUATION_HINT` (module scope) for the empty-content rationale.
+    //
+    // When `newUserContent` is empty, we yield CONTINUATION_HINT only when
+    // `hasPairedToolResults` is also true (i.e. the historic transcript
+    // really does end with a tool_result that the model should address).
+    // For other empty-content cases (e.g. pi sent a user message whose
+    // content reduced to nothing under our block translators) we fall
+    // back to the bundled binary's default `(no content)` placeholder —
+    // the hint about "the tool result above" would be misleading.
+    //
+    // See CONTINUATION_HINT (module scope) for the full rationale.
     async function* promptGen() {
+      const useHint = newUserContent.length === 0 && hasPairedToolResults;
       yield {
         type: "user" as const,
         message: {
           role: "user" as const,
-          content: newUserContent.length === 0
+          content: useHint
             ? CONTINUATION_HINT
-            : (newUserContent as any),
+            : newUserContent.length === 0
+              ? ""
+              : (newUserContent as any),
         },
         parent_tool_use_id: null,
       };

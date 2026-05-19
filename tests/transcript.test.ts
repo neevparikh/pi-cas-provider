@@ -20,17 +20,19 @@ function expectSynthMarkerAt(transcript: any[], idx: number): void {
 }
 
 describe("piToTranscript split rule", () => {
-  it("empty history → empty transcript, empty new content", () => {
-    const { transcript, newUserContent } = piToTranscript([], OPTS);
+  it("empty history → empty transcript, empty new content, no paired tool_results", () => {
+    const { transcript, newUserContent, hasPairedToolResults } = piToTranscript([], OPTS);
     expect(transcript).toEqual([]);
     expect(newUserContent).toEqual([]);
+    expect(hasPairedToolResults).toBe(false);
   });
 
-  it("only a user message (first turn) → transcript empty, new content is that user msg", () => {
+  it("only a user message (first turn) → transcript empty, new content is that user msg, no paired tool_results", () => {
     const msgs = [{ role: "user", content: "hi" }];
-    const { transcript, newUserContent } = piToTranscript(msgs as any[], OPTS);
+    const { transcript, newUserContent, hasPairedToolResults } = piToTranscript(msgs as any[], OPTS);
     expect(transcript).toEqual([]);
     expect(newUserContent).toEqual([{ type: "text", text: "hi" }]);
+    expect(hasPairedToolResults).toBe(false);
   });
 
   it("user → assistant: assistant ends history, no new prompt content, synth marker appended", () => {
@@ -86,7 +88,7 @@ describe("piToTranscript split rule", () => {
         isError: false,
       },
     ];
-    const { transcript, newUserContent } = piToTranscript(msgs as any[], OPTS);
+    const { transcript, newUserContent, hasPairedToolResults } = piToTranscript(msgs as any[], OPTS);
     // [user, assistant(tool_use), user(tool_result), synth-marker]
     expect(transcript).toHaveLength(4);
     expect(transcript[0].type).toBe("user");
@@ -105,6 +107,8 @@ describe("piToTranscript split rule", () => {
     // The genuinely-new user content is empty: no new user text, the
     // tool_result was paired and folded into historic.
     expect(newUserContent).toEqual([]);
+    // …and hasPairedToolResults is true (the continuation-hint case).
+    expect(hasPairedToolResults).toBe(true);
   });
 
   it("user → assistant(toolCall) → toolResult → user(text): paired tool_result folds, trailing user-text is the new prompt", () => {
@@ -246,6 +250,42 @@ describe("piToTranscript split rule", () => {
     ]);
   });
 
+  it("multi-round paired tool_results: trailing round folds into historic, earlier rounds intact", () => {
+    // Long-form history with multiple tool rounds, ending in another
+    // tool_use whose tool_result is in `trailing`.  Earlier paired rounds
+    // are preserved as-is (they go through buildHistoricEntries' default
+    // flow); the trailing round gets folded into historic + synth marker.
+    const msgs = [
+      { role: "user", content: "start a multi-step task" },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tu_round1", name: "read", arguments: { path: "/a" } }],
+      },
+      { role: "toolResult", toolCallId: "tu_round1", toolName: "read", content: "R1", isError: false },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tu_round2", name: "read", arguments: { path: "/b" } }],
+      },
+      { role: "toolResult", toolCallId: "tu_round2", toolName: "read", content: "R2", isError: false },
+    ];
+    const { transcript, newUserContent, hasPairedToolResults } = piToTranscript(msgs as any[], OPTS);
+    // [user, asst1(tu_r1), user(R1), asst2(tu_r2), user(R2 — folded in), synth-marker]
+    expect(transcript).toHaveLength(6);
+    expect(transcript[0].type).toBe("user");      // initial user msg
+    expect(transcript[1].type).toBe("assistant"); // round 1 asst
+    expect(transcript[2].type).toBe("user");      // round 1 toolresult
+    expect(transcript[3].type).toBe("assistant"); // round 2 asst
+    expect(transcript[4].type).toBe("user");      // round 2 toolresult (folded)
+    expectSynthMarkerAt(transcript, 5);
+    // parentUuid chain is well-formed through the synth marker.
+    expect(transcript[0].parentUuid).toBeNull();
+    for (let i = 1; i < transcript.length; i++) {
+      expect(transcript[i].parentUuid).toBe(transcript[i - 1].uuid);
+    }
+    expect(newUserContent).toEqual([]);
+    expect(hasPairedToolResults).toBe(true);
+  });
+
   it("toolResult with isError=true is preserved", () => {
     const msgs = [
       { role: "user", content: "do thing" },
@@ -267,6 +307,23 @@ describe("piToTranscript split rule", () => {
       },
     ]);
     expect(newUserContent).toEqual([]);
+  });
+
+  it("empty newUserContent without paired tool_results: hasPairedToolResults is false", () => {
+    // Edge case: a trailing user message with content that reduces to empty
+    // (e.g. unknown block types filtered out by piContentToAnthropicBlocks).
+    // newUserContent ends up empty, but it's NOT a tool-result continuation
+    // — hasPairedToolResults must be false so the caller doesn't yield the
+    // misleading "Continue based on the tool result above." hint.
+    const msgs = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      { role: "user", content: [{ type: "image_url", url: "weird-unknown-type" }] }, // filtered out
+    ];
+    const { transcript, newUserContent, hasPairedToolResults } = piToTranscript(msgs as any[], OPTS);
+    expect(newUserContent).toEqual([]);
+    expect(hasPairedToolResults).toBe(false);
+    expectSynthMarkerAt(transcript, 2); // historic still gets a synth marker
   });
 });
 

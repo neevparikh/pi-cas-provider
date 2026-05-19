@@ -69,6 +69,18 @@ export interface BuildTranscriptResult {
   transcript: TranscriptEntry[];
   /** Content the SDK should treat as the new user message for this turn. */
   newUserContent: AnthropicContentBlock[];
+  /**
+   * True if the historic transcript ends with one or more `tool_result`
+   * entries that pair with the last assistant turn's `tool_use`s.
+   *
+   * Callers (provider.ts) use this to decide whether the "tool-result-only
+   * continuation" hint applies when `newUserContent` is empty.  Without
+   * this flag, an empty newUserContent could also mean "pi yielded a user
+   * message whose content reduced to nothing" (e.g. unknown block types
+   * filtered out by piContentToAnthropicBlocks) — in that case yielding
+   * the tool-result hint would be misleading.
+   */
+  hasPairedToolResults: boolean;
 }
 
 export interface BuildTranscriptOpts {
@@ -118,6 +130,7 @@ export function piToTranscript(
     return {
       transcript: [],
       newUserContent: buildNewUserContent(messages),
+      hasPairedToolResults: false,
     };
   }
 
@@ -171,6 +184,7 @@ export function piToTranscript(
   return {
     transcript: historicEntries,
     newUserContent: buildNewUserContent(leftover),
+    hasPairedToolResults: pairedToolResults.length > 0,
   };
 }
 
@@ -180,15 +194,20 @@ export function piToTranscript(
  * The synthetic assistant marker that goes at the end of every non-empty
  * historic transcript.
  *
- * The exact strings here are the bundled `claude` binary's own internal
- * sentinels:
+ * The exact strings here intentionally match the bundled `claude` binary's
+ * own internal sentinels:
  *   - `model: "<synthetic>"`  (the binary's `jG` constant)
  *   - `text: "No response requested."`  (the binary's `TGH` constant)
  *
- * Various filters in the binary already special-case these (usage tracking
+ * Various filters in the binary special-case these strings (usage tracking
  * excludes them, certain views strip them, etc.), so our marker is
- * indistinguishable from a marker the binary itself would synthesize during
- * its own resume-recovery flow.
+ * indistinguishable from a marker the binary itself would synthesize
+ * during its own resume-recovery flow — the rest of the binary's plumbing
+ * treats it normally.  Whether the API-side model has been trained to
+ * gracefully ignore this exact pattern is unverified; what we DO know is
+ * the empirical validation across 5 e2e scenarios (see
+ * writeups/write_up.md): the model produces contextually-correct
+ * responses despite the marker's presence.
  *
  * Why we need this entry at the end of the transcript:
  *
