@@ -42,6 +42,28 @@ import { loadState, saveState, statePath } from "./persistence.js";
 import { requestRelay, type RelayConfig } from "./relay.js";
 import { startLogProxy, type LogProxyHandle } from "./http-log-proxy.js";
 
+/**
+ * Continuation hint yielded via promptGen when pi-cas has no genuinely-new
+ * user content for this turn (the common tool-result-only continuation case).
+ *
+ * Background: after the synth-asst-marker fix in transcript.ts, every
+ * non-empty historic transcript ends with a synthetic assistant message
+ * ("No response requested.").  Yielding empty content via promptGen makes
+ * the bundled `claude` binary substitute its `(no content)` placeholder,
+ * and the model then treats the conversation as "finished" — replying with
+ * a generic acknowledgement like "I'm here if you need anything else" —
+ * rather than responding to the tool_result earlier in the buffer.
+ *
+ * A substantive continuation hint nudges the model to actually respond to
+ * the recent tool_result.  Empirically verified during design probes: with
+ * this hint, the model produces the expected contextual response ("The
+ * command printed: ...") rather than a generic acknowledgement.
+ *
+ * The hint is visible only to the model.  Pi-cas's promptGen output is NOT
+ * persisted to pi's history, so users never see it.
+ */
+const CONTINUATION_HINT = "Continue based on the tool result above.";
+
 /** Top-level entry called by index.ts. */
 export function registerProvider(pi: ExtensionAPI): void {
   // Module-level config; slash commands mutate this.
@@ -200,9 +222,9 @@ function streamViaSDK(
     // Empty newUserContent is an expected case after the transcript.ts fix:
     // it means pi just ran a tool and the matching tool_result was paired
     // into the historic transcript, leaving no genuinely-new user content
-    // for this turn.  promptGen yields a `.` continuation hint in that case
-    // (see comment there for rationale).  We log only in DEBUG mode now —
-    // this is no longer the bug-signal it once was.
+    // for this turn.  promptGen yields CONTINUATION_HINT in that case
+    // (see the const at module scope for rationale).  We log only in DEBUG
+    // mode — this is no longer the bug-signal it once was.
     if (DEBUG && newUserContent.length === 0) {
       console.error(
         `[pi-cas/debug] newUserContent empty (tool-result-only continuation — ` +
@@ -361,29 +383,7 @@ function streamViaSDK(
     const bridge = createEventBridge(stream, model);
 
     // 8. Prompt generator — yields the new user turn's content.
-    //
-    // Continuation hint when newUserContent is empty (tool-result-only
-    // continuation case):
-    //
-    // After piToTranscript's fix for the orphan-prune bug, the transcript
-    // ends with a synthetic assistant marker ("No response requested.").
-    // When there's no genuinely-new user content — the common case where
-    // pi ran a tool and just wants the model's follow-up — yielding empty
-    // content makes the bundled `claude` binary substitute its `(no
-    // content)` placeholder, and the model treats the conversation as
-    // "finished" ("I'm here if you need anything else") rather than
-    // responding to the tool_result that's earlier in the buffer.
-    //
-    // A substantive continuation hint nudges the model to actually
-    // respond to the recent tool_result. Empirically verified during
-    // design probes: with this hint, the model produces the expected
-    // contextual response ("The command printed: ...") rather than a
-    // generic acknowledgement.
-    //
-    // The hint is visible only to the model — it never appears in pi's
-    // history (pi-cas's promptGen output isn't persisted on pi's side),
-    // so users don't see it.
-    const CONTINUATION_HINT = "Continue based on the tool result above.";
+    // See `CONTINUATION_HINT` (module scope) for the empty-content rationale.
     async function* promptGen() {
       yield {
         type: "user" as const,

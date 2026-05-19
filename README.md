@@ -36,8 +36,13 @@ through Claude Code's settings layer, not the raw Messages API.
 - **Pi-native history.** Pi's conversation history is materialized as a real Claude
   Code transcript JSONL via the SDK's alpha `SessionStore` API — no flattened
   `USER:` / `ASSISTANT:` text history hack, real `tool_use` / `tool_result` pairings.
-- **Pi-native tool execution.** The SDK is configured with `canUseTool: deny` so it
-  never executes tools itself; pi runs every tool, just as with any other provider.
+- **Pi-native tool execution (best-effort).** The SDK is configured with
+  `canUseTool: deny + interrupt` and pi-cas breaks the SDK iterator on the
+  first `tool_use` so pi runs the tool, just as with any other provider. (See
+  "Known caveats" — the bundled binary's internal auto-classifier silently
+  short-circuits canUseTool for tools it deems benign, so pi-cas relies on the
+  iterator break-early. Most tools pi cares about are idempotent enough that
+  this fragility hasn't been a problem in practice.)
 - **Inherits Claude Code auth.** No separate login flow; whatever `claude auth status`
   reports is what this provider uses.
 
@@ -356,10 +361,21 @@ pi → streamSimple(model, context, options)
   behavior deltas that can't be losslessly translated are documented in a
   provider-managed `<pi-environment-override>` block appended to pi's system prompt
   before each request.
-- `canUseTool: deny + interrupt` keeps the SDK from executing tools itself; pi
-  handles every tool call. A break-early loop on `message_stop` after the first
-  `tool_use` prevents the SDK from running a second internal turn that would
-  contaminate the assistant message with post-denial text.
+- `canUseTool: deny + interrupt` is the *intended* mechanism for keeping the SDK
+  from executing tools, but the binary's auto-classifier silently bypasses it
+  for benign tools (empirically verified across permissionMode variants and
+  with clean `CLAUDE_CONFIG_DIR`). Pi-cas instead relies on the iterator-break
+  loop on `message_stop` after the first `tool_use` to terminate the subprocess
+  before it auto-runs (a race that the subprocess sometimes wins for fast
+  tools — see "Known caveats").
+- `src/transcript.ts` appends a synthetic assistant marker
+  (`model:"<synthetic>"`, text `"No response requested."`) at the end of every
+  non-empty historic transcript. This suppresses the bundled binary's resume
+  normalizer (orphan-prune + interrupted-turn detection) which would otherwise
+  splice in `"Continue from where you left off."` user + `"No response
+  requested."` assistant messages, producing the "Picking up where I left off"
+  output the model used to open with. See `writeups/write_up.md` for the full
+  design and empirical validation.
 
 ## Status & known issues
 
@@ -380,6 +396,19 @@ pi → streamSimple(model, context, options)
   with?" responses on the post-tool-result turn. Workaround: use Opus for tool-using
   tasks. Proper fix planned for v0.2 — expose pi's tools by pi's own names via an
   in-process MCP server, eliminating the name conflict.
+- **Subprocess sometimes auto-runs tools alongside pi.** The bundled binary's
+  internal auto-classifier silently bypasses `canUseTool` for tools it deems
+  benign (`echo hello`, `printf`, simple `Read` calls, etc.). Pi-cas's
+  iterator-break races to terminate the subprocess before it completes the
+  auto-run, but the subprocess does sometimes win and ends up running the tool
+  itself — then pi also runs it via its normal flow. For idempotent tools the
+  double-execution is invisible; for non-idempotent tools (file writes, network
+  calls with side effects) it can be a real issue. Proper fix is part of the
+  v0.2 MCP refactor.
+- **`~/.claude/settings.json` allow rules leak through `settingSources: []`.**
+  If the user has Claude Code permission rules in their global settings, the
+  subprocess auto-allows matching tool calls without consulting pi-cas's
+  canUseTool. Set `PI_CAS_CLAUDE_CONFIG_DIR` to a clean directory to isolate.
 - **`sessionStore` is an alpha SDK API.** Future SDK versions may change the on-disk
   transcript JSONL shape. The empirically validated shape is captured in
   `src/transcript.ts`. Pinned to `@anthropic-ai/claude-agent-sdk@^0.3.143`.
@@ -398,7 +427,7 @@ pi → streamSimple(model, context, options)
 
 ```bash
 npm install
-npm test            # 38 unit tests (transcript + tool-shim)
+npm test            # 73 unit tests (transcript + tool-shim + relay + …)
 npm run typecheck   # tsc --noEmit
 ```
 

@@ -121,34 +121,39 @@ export function piToTranscript(
     };
   }
 
-  // Step 2: collect tool_use ids on the last assistant turn (after our shim
-  // would have mapped names — see piAssistantBlocksToAnthropic).  Pi stores
-  // tool calls under the `toolCall` content type with the pre-shim id
-  // unchanged, so the ids match the tool_result.toolCallId values.
+  // Step 2: collect tool_use ids on the last assistant turn (the pre-shim
+  // ids — pi stores them under `toolCall.id` with their original values,
+  // matching tool_result.toolCallId).
   const lastAsst = messages[lastAssistantIdx];
-  const lastAsstToolUseIds = new Set<string>();
+  const unmatchedToolUseIds = new Set<string>();
   if (lastAsst.role === "assistant" && Array.isArray(lastAsst.content)) {
     for (const b of lastAsst.content) {
-      if (b.type === "toolCall" && typeof (b as any).id === "string") {
-        lastAsstToolUseIds.add((b as any).id);
+      if (b.type === "toolCall" && typeof b.id === "string") {
+        unmatchedToolUseIds.add(b.id);
       }
     }
   }
 
-  // Step 3: split trailing messages into (a) tool_results that pair with the
-  // last assistant turn vs (b) everything else.
+  // Step 3: split trailing messages into (a) tool_results that pair 1:1 with
+  // the last assistant's tool_uses, and (b) everything else.
   //
-  // We accept tool_results in any order within the trailing run as long as
-  // each one's toolCallId matches a tool_use id from the last assistant.
-  // Once we encounter a non-toolResult or an unpaired toolResult, we stop
-  // pairing — anything after is genuine new content (user text, etc.).
+  // Pairing is consumed: each matched tool_use_id is removed from the set so
+  // a second tool_result with the same id (defensive case — shouldn't happen
+  // in normal pi flows) falls into `leftover` rather than producing a
+  // duplicate `tool_result` block on disk, which the Anthropic API rejects.
+  //
+  // Once we encounter any non-toolResult message, or a toolResult whose id
+  // doesn't match an unmatched tool_use, we stop pairing — everything else
+  // is genuine new content (user text, unpaired tool_results, etc.).
   const trailing = messages.slice(lastAssistantIdx + 1);
   const pairedToolResults: PiMessage[] = [];
   const leftover: PiMessage[] = [];
-  let stillPairing = lastAsstToolUseIds.size > 0;
+  let stillPairing = unmatchedToolUseIds.size > 0;
   for (const m of trailing) {
-    if (stillPairing && m.role === "toolResult" && lastAsstToolUseIds.has(m.toolCallId)) {
+    if (stillPairing && m.role === "toolResult" && unmatchedToolUseIds.has(m.toolCallId)) {
       pairedToolResults.push(m);
+      unmatchedToolUseIds.delete(m.toolCallId); // consume the pairing
+      if (unmatchedToolUseIds.size === 0) stillPairing = false;
       continue;
     }
     stillPairing = false;

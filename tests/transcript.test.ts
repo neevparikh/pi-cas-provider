@@ -180,19 +180,93 @@ describe("piToTranscript split rule", () => {
     expect(newUserContent).toEqual([]);
   });
 
-  it("empty history: no synth marker (nothing to ward off)", () => {
-    const { transcript, newUserContent } = piToTranscript([], OPTS);
-    expect(transcript).toEqual([]);
-    expect(newUserContent).toEqual([]);
+  // The first two tests in this describe block cover the empty-history and
+  // first-turn-no-assistant cases (no synth marker added — nothing to ward
+  // off when the disk transcript has no assistant turn at all).
+
+  it("unpaired toolResult after the last assistant: stays in newUserContent", () => {
+    // The last assistant has tool_uses tu_a and tu_b.  tu_a is paired
+    // (gets folded into historic), tu_b is unpaired (no result yet —
+    // unusual but pi could in principle send a partial batch).  The
+    // unpaired result stays in newUserContent.
+    const msgs = [
+      { role: "user", content: "do two things" },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "tu_a", name: "read", arguments: { path: "/a" } },
+          { type: "toolCall", id: "tu_b", name: "read", arguments: { path: "/b" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "tu_a", toolName: "read", content: "A", isError: false },
+      // tu_b's result hasn't arrived yet — there's a different unpaired thing
+      { role: "toolResult", toolCallId: "tu_unrelated", toolName: "read", content: "???", isError: false },
+    ];
+    const { transcript, newUserContent } = piToTranscript(msgs as any[], OPTS);
+    // tu_a paired → in historic; tu_unrelated unpaired → in newUserContent;
+    // tu_b stays orphan (no matching tool_result for it anywhere)
+    expect(transcript.length).toBeGreaterThan(2);
+    // The transcript still has tu_a's tool_result in a user entry, then synth
+    expectSynthMarkerAt(transcript, transcript.length - 1);
+    // The tu_unrelated tool_result is in newUserContent
+    expect(newUserContent).toEqual([
+      {
+        type: "tool_result",
+        tool_use_id: "tu_unrelated",
+        content: "???",
+        is_error: false,
+      },
+    ]);
   });
 
-  it("first-turn user only: no synth marker (no assistant yet, no orphan risk)", () => {
-    const { transcript, newUserContent } = piToTranscript(
-      [{ role: "user", content: "hi" }] as any[],
-      OPTS,
-    );
-    expect(transcript).toEqual([]);
-    expect(newUserContent).toEqual([{ type: "text", text: "hi" }]);
+  it("duplicate paired toolCallId: second one falls into newUserContent, no duplicate in historic", () => {
+    // Defensive: if pi ever sends two tool_results with the same tool_use_id,
+    // we MUST NOT produce duplicate tool_result blocks in a single historic
+    // user entry — the Anthropic API rejects that.  Pairing is 1:1.
+    const msgs = [
+      { role: "user", content: "x" },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tu_dup", name: "read", arguments: { path: "/x" } }],
+      },
+      { role: "toolResult", toolCallId: "tu_dup", toolName: "read", content: "first", isError: false },
+      { role: "toolResult", toolCallId: "tu_dup", toolName: "read", content: "second", isError: false },
+    ];
+    const { transcript, newUserContent } = piToTranscript(msgs as any[], OPTS);
+    // First tu_dup result folded into historic, second one in newUserContent.
+    const historicUserToolResults = transcript
+      .filter((e) => e.type === "user")
+      .map((e) => (e.message as any).content)
+      .flat()
+      .filter((c) => c.type === "tool_result");
+    expect(historicUserToolResults).toHaveLength(1);
+    expect(historicUserToolResults[0]).toMatchObject({ tool_use_id: "tu_dup", content: "first" });
+    expect(newUserContent).toEqual([
+      { type: "tool_result", tool_use_id: "tu_dup", content: "second", is_error: false },
+    ]);
+  });
+
+  it("toolResult with isError=true is preserved", () => {
+    const msgs = [
+      { role: "user", content: "do thing" },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tu_err", name: "bash", arguments: { command: "false" } }],
+      },
+      { role: "toolResult", toolCallId: "tu_err", toolName: "bash", content: "command failed", isError: true },
+    ];
+    const { transcript, newUserContent } = piToTranscript(msgs as any[], OPTS);
+    // tu_err pairs and folds into historic with is_error preserved.
+    const trUserMsg = transcript[2].message as any;
+    expect(trUserMsg.content).toEqual([
+      {
+        type: "tool_result",
+        tool_use_id: "tu_err",
+        content: "command failed",
+        is_error: true,
+      },
+    ]);
+    expect(newUserContent).toEqual([]);
   });
 });
 

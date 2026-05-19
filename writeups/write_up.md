@@ -1,5 +1,33 @@
 # pi-cas-provider — "Picking up where I left off" fix
 
+## Pivot disclosure (read first)
+
+The original user instruction was to implement **Option B** in full (long-lived
+`query()` per pi session via AsyncIterable<SDKUserMessage>). Empirical probing
+uncovered that the design depends on `canUseTool: deny+interrupt` firing
+reliably to prevent the SDK from auto-running tools — and it does NOT. The
+bundled binary's auto-classifier auto-allows benign tool calls in ~3ms, without
+calling canUseTool. Confirmed across:
+
+- Pi-cas's exact production config (multiple variations)
+- A clean `CLAUDE_CONFIG_DIR` (rules out user-settings leakage)
+- All four documented `permissionMode` values (`default`, `acceptEdits`, `plan`, `dontAsk`)
+
+The `PreToolUse` hook mechanism DOES fire reliably and CAN block tools, but
+yielding the real tool_result via the gen afterward produces a duplicate
+`tool_use_id` (the binary already paired the hook's deny as a synthetic
+tool_result internally) which the Anthropic API rejects.
+
+So Option B as designed isn't reachable through the SDK's standard surface.
+Reachable alternatives are larger refactors (SDK-runs-tools = Option A, plus
+long-lived query) that change pi-cas's pi-facing contract.
+
+**Shipped instead: a smaller "synth-asst marker" fix.** It solves the bug
+structurally at the transcript layer, ships in a single commit, has E2E
+validation across 5 scenarios, and doesn't change pi-cas's public contract.
+The Option B work is documented as a deferred path with the empirical
+findings preserved.
+
 ## Project goal
 
 Fix the "Picking up where I left off" / `(no content)` / `"Continue from where you left off."` injection bug in pi-cas-provider.
@@ -94,19 +122,59 @@ That's the binary's `jG` constant. Various filters in the binary (e.g. `A7K`, `s
 
 The earlier reverted commit `6e80c9e` defanged pi's `COMPACTION_SUMMARY_PREFIX`. That's a different bug — model says "Picking back up…" even on text-only conversations when compaction was used, because the compaction summary prefix is byte-identical to Claude Code's own compaction prefix and Opus recognizes it as a resume signal. The synth-asst marker doesn't address that compaction case — it would still need a separate fix if it becomes a priority. For now it's lower priority than the tool-use orphan injection.
 
+## Architecture: empty-prompt handling (`CONTINUATION_HINT`)
+
+The synth-asst marker fix has one subtle interaction with pi's per-turn model.
+When pi runs a tool and then calls `streamSimple` again to get the model's
+reflection, pi-cas's new `piToTranscript` folds the tool_result into the
+historic transcript and leaves `newUserContent` empty.
+
+If we then yield empty content via `promptGen`, the bundled binary substitutes
+its `(no content)` placeholder.  The model sees the synth-marker assistant
+saying "No response requested." followed by user "(no content)" and concludes
+the conversation is over, replying with generic acknowledgements like "I'm
+here if you need anything else" — NOT addressing the tool_result above.
+
+Fix: in `src/provider.ts`, when `newUserContent.length === 0`, `promptGen`
+yields the constant `CONTINUATION_HINT = "Continue based on the tool result
+above."` instead.  Empirically verified during E2E probes — the model now
+produces the expected contextual response.
+
+The hint is yielded via `promptGen` only and is NOT persisted into pi's
+history (pi-cas stores only the assistant's response, not the prompt it
+yielded), so users never see it.
+
 ## Current status
 
-- **Investigation**: Complete (this writeup + progress_log.md).
-- **Probe**: `/tmp/pi-cas-resume-probe/probe-warm-multi-turn.mjs` validates the long-lived-query lifecycle but exposes the canUseTool auto-allow issue that blocks Option B.
-- **Fix implementation**: In progress (next step).
-- **Tests**: Not yet updated for the new transcript shape.
-- **Type check + lint**: Pending fix.
+- **Investigation**: complete.
+- **Fix implementation**: committed (commit `9e784f2` and a follow-up
+  with reviewer-feedback fixes).
+- **Tests**: 73 tests pass, typecheck clean.
+- **E2E validation**: `/tmp/pi-cas-resume-probe/probe-e2e-scenarios.mjs`
+  passes all 5 scenarios (tool-result-only continuation, user follow-up,
+  pure text, first turn, multi-step tool sequence).
+- **Reviewer feedback addressed**: duplicate-`toolCallId` pairing bug fixed,
+  `CONTINUATION_HINT` hoisted to module scope, stale comment removed,
+  test coverage expanded (unpaired toolResult, duplicate id, isError).
+- **Pre-existing issues flagged but not in scope** for this fix:
+  - README claims about `canUseTool: deny` keeping the SDK from running
+    tools (contradicted by probe findings; pi-cas's production already has
+    the SDK auto-running tools and pi double-executing).
+  - Pi compaction-summary prefix bug (separate code path; previously
+    fixed in `6e80c9e` and reverted in `e43b124`).
+  - Custom pi tools not exposed to the SDK (v0.2 plan per README).
+
+See `writeups/progress_log.md` for chronological notes and the canUseTool
+investigation details.
+See `writeups/continuation_context.md` for handoff context.
 
 ## Failed approaches and dead ends
 
-- **`hook_deferred_tool` attachment**: documented escape via `dG8`. Empirically does NOT fire in SDK resume path. Cause unknown without deeper binary debugging.
-- **Long-lived `query()` + `canUseTool: deny+interrupt`**: SDK supports this pattern but the binary auto-allows benign tools without consulting canUseTool, defeating the design.
-- **`settingSources: []` + inline empty settings**: doesn't fully suppress the binary's auto-allow path.
-- **`tools: [Bash]` + `allowedTools: []`**: makes Bash available without auto-allowing, but the binary's internal auto-classifier still fires for benign commands.
-- **`permissionMode: "default"`**: doesn't disable the auto-classifier.
-- **Defang compaction prefix**: a different fix for a different bug, reverted earlier; not addressed here.
+- **`hook_deferred_tool` attachment** (documented `dG8` escape): empirically does NOT fire in SDK resume path; cause unknown without deeper binary debugging.
+- **Long-lived `query()` + `canUseTool: deny+interrupt`** (Option B as originally designed): SDK supports the long-lived pattern, but `canUseTool` doesn't fire for tools the binary's internal auto-classifier short-circuits as benign. Confirmed across permissionMode variants AND with a clean CLAUDE_CONFIG_DIR.
+- **`settingSources: []` + inline empty settings**: doesn't suppress the auto-classifier.
+- **`tools: [Bash]` + `allowedTools: []`**: tool available without auto-allow, but auto-classifier still bypasses canUseTool.
+- **`permissionMode` variants** (`default`/`acceptEdits`/`plan`/`dontAsk`): none route through canUseTool for benign Bash.
+- **`PreToolUse` hook with `permissionDecision: "deny"`**: hook DOES fire and DOES block, but yielding the real tool_result afterward via the SDK's prompt gen creates a duplicate `tool_use_id` (the binary already paired the hook's synthetic deny as a tool_result), which the Anthropic API rejects.
+- **`PreToolUse` hook with `permissionDecision: "defer"`**: model retries the tool 3 times then gives up with `stop_reason: tool_deferred` — undesirable retry behavior.
+- **Defang compaction prefix**: a different fix for a different bug (`6e80c9e`, reverted in `e43b124`); not addressed here.
