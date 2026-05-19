@@ -58,6 +58,12 @@ export function registerProvider(pi: ExtensionAPI): void {
   if (config.configDirOverride) {
     console.error(`[pi-cas] CLAUDE_CONFIG_DIR override: ${config.configDirOverride}`);
   }
+  if (config.apiKeyOverride) {
+    console.error("[pi-cas] ANTHROPIC_API_KEY override active (PI_CAS_API_KEY)");
+  }
+  if (config.baseUrlOverride) {
+    console.error(`[pi-cas] ANTHROPIC_BASE_URL override: ${config.baseUrlOverride}`);
+  }
 
   // Badge: emits `pi-cas:fast-mode` events + owns the `pi-cas-fast` status
   // entry in the footer. Both surfaces are no-ops for anyone who doesn't
@@ -149,6 +155,7 @@ function streamViaSDK(
     }
     if (config.configDirOverride) env.CLAUDE_CONFIG_DIR = config.configDirOverride;
     if (config.apiKeyOverride) env.ANTHROPIC_API_KEY = config.apiKeyOverride;
+    if (config.baseUrlOverride) env.ANTHROPIC_BASE_URL = config.baseUrlOverride;
     if (fastFrag.env) Object.assign(env, fastFrag.env);
 
     // 5. Hook up abort.
@@ -415,6 +422,7 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
         `  fast mode (actual):  ${realityLabel}`,
         `  config dir:          ${config.configDirOverride ?? "(default ~/.claude)"}`,
         `  api key override:    ${config.apiKeyOverride ? "PI_CAS_API_KEY set" : "no"}`,
+        `  base url override:   ${config.baseUrlOverride ?? "(none — SDK default or ANTHROPIC_BASE_URL)"}`,
         `  active SDK sessions: ${config.sdkSessionIds.size}`,
         `  persisted state:     ${statePath()}`,
       ];

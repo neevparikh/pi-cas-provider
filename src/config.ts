@@ -18,6 +18,13 @@ export interface ProviderConfig {
   /** Override for ANTHROPIC_API_KEY. Undefined → inherit from process env. */
   apiKeyOverride?: string;
   /**
+   * Override for ANTHROPIC_BASE_URL applied **only** in the subprocess env.
+   * Undefined → inherit whatever the user has set globally. Set via
+   * `PI_CAS_BASE_URL=...` to route pi-cas traffic through a proxy or alternate
+   * endpoint without affecting other Anthropic-using tools on the machine.
+   */
+  baseUrlOverride?: string;
+  /**
    * Per-pi-session SDK session id, set the first time we get a request with a
    * given pi sessionId. Lets the SDK's transcript stay consistent across turns,
    * though we re-inject history each turn via sessionStore.load() regardless.
@@ -59,6 +66,7 @@ export function createDefaultConfig(): ProviderConfig {
     fastModeWarned: false,
     configDirOverride: process.env.PI_CAS_CLAUDE_CONFIG_DIR,
     apiKeyOverride: process.env.PI_CAS_API_KEY,
+    baseUrlOverride: process.env.PI_CAS_BASE_URL,
     sdkSessionIds: new Map(),
   };
 }

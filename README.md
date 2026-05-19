@@ -89,6 +89,7 @@ All optional. Set as environment variables before launching pi.
 | `PI_CAS_FAST_MODE=1` | Start with fast mode ON (Opus 4.6/4.7 only). Default off. |
 | `PI_CAS_CLAUDE_CONFIG_DIR=<path>` | Override the subprocess `CLAUDE_CONFIG_DIR`. Auth + sessions live here instead of `~/.claude`. Useful for isolating pi's Claude Code state from your normal CLI usage. |
 | `PI_CAS_API_KEY=sk-ant-...` | Override `ANTHROPIC_API_KEY` for this provider only (e.g., a separate API key from your default). |
+| `PI_CAS_BASE_URL=https://...` | Override `ANTHROPIC_BASE_URL` for this provider only. Useful for routing pi-cas through a proxy or alternate endpoint without affecting other Anthropic-using tools. |
 | `PI_CAS_DEBUG=1` | Log per-request details (model, history sizes, fast-mode state, cost) to stderr. |
 | `CLAUDE_CODE_ENABLE_OPUS_4_7_FAST_MODE=1` | Set automatically by this provider when fast mode is on and the selected model is `claude-opus-4-7`. |
 
