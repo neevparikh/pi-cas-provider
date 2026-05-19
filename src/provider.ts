@@ -39,6 +39,7 @@ import {
 } from "./config.js";
 import { loadState, saveState, statePath } from "./persistence.js";
 import { requestRelay, type RelayConfig } from "./relay.js";
+import { startLogProxy, type LogProxyHandle } from "./http-log-proxy.js";
 
 /** Top-level entry called by index.ts. */
 export function registerProvider(pi: ExtensionAPI): void {
@@ -47,6 +48,41 @@ export function registerProvider(pi: ExtensionAPI): void {
   // from pi-cas.json) can short-circuit the local-auth classification, which
   // is misleading when the subprocess is going through a relay anyway.
   const config: ProviderConfig = createDefaultConfig();
+
+  // Optional HTTP log proxy. Enabled by PI_CAS_HTTP_LOG=/path/to/file.jsonl.
+  // When set, the proxy spins up at startup and pi-cas points the subprocess
+  // at it; the proxy logs every Anthropic request/response (with sensitive
+  // headers redacted) and forwards to the *real* upstream. The upstream is
+  // updated per-turn so it follows the okta relay's URL when okta is on.
+  // We start asynchronously and let streamViaSDK await the promise on the
+  // first turn, so a slow startup doesn't block extension registration.
+  let logProxyPromise: Promise<LogProxyHandle> | undefined;
+  const httpLogPath = process.env.PI_CAS_HTTP_LOG?.trim();
+  if (httpLogPath) {
+    const logResponseBody = process.env.PI_CAS_HTTP_LOG_RESPONSES === "1" ||
+                            process.env.PI_CAS_HTTP_LOG_RESPONSES === "true";
+    // Initial upstream is a placeholder; pi-cas overrides it before each turn
+    // via setUpstreamBaseUrl(). We pick api.anthropic.com as a sane default in
+    // case someone hits the proxy before the first turn.
+    logProxyPromise = startLogProxy({
+      initialUpstreamBaseUrl: "https://api.anthropic.com",
+      logFilePath: httpLogPath,
+      logResponseBody,
+    });
+    logProxyPromise.then(
+      (h) =>
+        console.error(
+          `[pi-cas] HTTP log proxy listening on ${h.getBaseUrl()} → (per-turn upstream); ` +
+            `log: ${h.logFilePath}${logResponseBody ? " (with response bodies)" : ""}`,
+        ),
+      (err) =>
+        console.error(
+          `[pi-cas] HTTP log proxy failed to start: ${
+            err instanceof Error ? err.message : String(err)
+          } — continuing without it`,
+        ),
+    );
+  }
 
   const auth = getAuthStatus();
   console.error(
@@ -117,7 +153,7 @@ export function registerProvider(pi: ExtensionAPI): void {
     api: PROVIDER_ID as any,
     models,
     streamSimple: (model, context, options) =>
-      streamViaSDK(pi, model, context as Context, options, config, badge),
+      streamViaSDK(pi, model, context as Context, options, config, badge, logProxyPromise),
   });
 }
 
@@ -130,6 +166,7 @@ function streamViaSDK(
   options: SimpleStreamOptions | undefined,
   config: ProviderConfig,
   badge: FastModeBadge,
+  logProxyPromise: Promise<LogProxyHandle> | undefined,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
 
@@ -231,6 +268,28 @@ function streamViaSDK(
       if (config.baseUrlOverride) env.ANTHROPIC_BASE_URL = config.baseUrlOverride;
     }
     if (fastFrag.env) Object.assign(env, fastFrag.env);
+
+    // 4b. If the HTTP log proxy is enabled, redirect the subprocess through
+    // it. The proxy snoops on the wire and forwards to whichever upstream
+    // we just decided on. We MUST set ANTHROPIC_BASE_URL last (after fastFrag
+    // and the relay/override block) so the proxy URL isn't clobbered.
+    if (logProxyPromise) {
+      try {
+        const proxy = await logProxyPromise;
+        const trueUpstream =
+          env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com";
+        proxy.setUpstreamBaseUrl(trueUpstream);
+        env.ANTHROPIC_BASE_URL = proxy.getBaseUrl();
+        if (DEBUG) {
+          console.error(
+            `[pi-cas/debug] HTTP log proxy active: ${proxy.getBaseUrl()} → ${trueUpstream}`,
+          );
+        }
+      } catch (err) {
+        // Already logged at startup; just continue without the proxy.
+        if (DEBUG) console.error(`[pi-cas/debug] log proxy unavailable, skipping`, err);
+      }
+    }
 
     // 5. Hook up abort.
     const abortController = new AbortController();

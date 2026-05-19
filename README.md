@@ -90,8 +90,50 @@ All optional. Set as environment variables before launching pi.
 | `PI_CAS_CLAUDE_CONFIG_DIR=<path>` | Override the subprocess `CLAUDE_CONFIG_DIR`. Auth + sessions live here instead of `~/.claude`. Useful for isolating pi's Claude Code state from your normal CLI usage. |
 | `PI_CAS_API_KEY=sk-ant-...` | Override `ANTHROPIC_API_KEY` for this provider only (e.g., a separate API key from your default). |
 | `PI_CAS_BASE_URL=https://...` | Override `ANTHROPIC_BASE_URL` for this provider only. Useful for routing pi-cas through a proxy or alternate endpoint without affecting other Anthropic-using tools. |
+| `PI_CAS_HTTP_LOG=/path/to/file.jsonl` | Start a local logging proxy that captures every HTTP request the bundled `claude` subprocess sends, with sensitive headers redacted. Appends JSONL to the given path. See "Debugging requests" below. |
+| `PI_CAS_HTTP_LOG_RESPONSES=1` | Also log response bodies (SSE streams), capped at 1 MiB each. Default off because SSE volumes can be large. |
 | `PI_CAS_DEBUG=1` | Log per-request details (model, history sizes, fast-mode state, cost) to stderr. |
 | `CLAUDE_CODE_ENABLE_OPUS_4_7_FAST_MODE=1` | Set automatically by this provider when fast mode is on and the selected model is `claude-opus-4-7`. |
+
+## Debugging: capturing the exact requests
+
+When `PI_CAS_HTTP_LOG` is set, pi-cas spins up a tiny HTTP-in / HTTPS-out
+logging proxy at startup, points the bundled `claude` subprocess at it, and
+appends a JSONL entry per request to the file. Useful for debugging what
+pi-cas + the SDK actually send to Anthropic (or to the okta relay).
+
+```sh
+PI_CAS_HTTP_LOG=/tmp/pi-cas-http.jsonl \
+PI_CAS_HTTP_LOG_RESPONSES=1 \
+  pi --provider pi-cas --model claude-opus-4-7
+```
+
+The log records, per request:
+
+- timestamp, request id
+- method, full upstream URL
+- request headers (with `x-api-key`, `authorization`, `anthropic-api-key`,
+  `proxy-authorization` redacted — their lengths are preserved for debugging)
+- request body (parsed as JSON if `content-type` says so, otherwise raw)
+- response status + headers
+- response body (when `PI_CAS_HTTP_LOG_RESPONSES=1`; SSE captured up to 1 MiB)
+
+In okta-relay mode, the proxy follows the relay's URL automatically (the
+upstream is swapped per-turn via `setUpstreamBaseUrl`). When the relay
+changes, a `upstream_changed` entry is emitted.
+
+Quick analysis with `jq`:
+
+```sh
+# Just the request bodies, latest first
+jq -r 'select(.type=="request") | .body' < /tmp/pi-cas-http.jsonl | tail -1
+
+# Watch for slow requests
+jq -r 'select(.type=="response_end") | "\(.elapsedMs)ms \(.id)"' < /tmp/pi-cas-http.jsonl | sort -n | tail
+
+# Any non-2xx responses
+jq -r 'select(.type=="response_start" and .status >= 400)' < /tmp/pi-cas-http.jsonl
+```
 
 ## Slash commands
 
