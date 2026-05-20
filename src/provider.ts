@@ -85,7 +85,7 @@ import {
   type SimpleStreamOptions,
   type Context,
 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { composeSystemPrompt } from "./system-prompt.js";
 import { mapEffort } from "./effort.js";
@@ -101,6 +101,7 @@ import {
   SUPPORTED_CC_TOOL_NAMES,
 } from "./stub-tools.js";
 import { createTaskStub, TASK_TOOL_NAME } from "./task-stub.js";
+import { handleCanUseTool } from "./interactive-tools.js";
 import {
   type ProviderConfig,
   createDefaultConfig,
@@ -208,6 +209,33 @@ export function registerProvider(pi: ExtensionAPI): void {
   // Seeded from SUPPORTED_CC_TOOL_NAMES below after the named stubs are
   // registered.
   const registeredStubNames = new Set<string>();
+
+  // Most-recently-seen ExtensionContext, captured from event handlers.
+  //
+  // # Why
+  //
+  // The SDK's `canUseTool` callback (see `interactive-tools.ts`) needs to
+  // render pi-tui UI to handle interactive tools like `AskUserQuestion`,
+  // but `canUseTool` is invoked by the SDK with no `ctx` argument, and
+  // pi's `ExtensionAPI` has no global `.ui` accessor — the UI is only
+  // accessible through `ctx: ExtensionContext` passed to event handlers.
+  //
+  // We bridge by subscribing to early-firing handlers (`before_agent_start`,
+  // `turn_start`, `message_start`, `tool_execution_start`) and stashing the
+  // most recent `ctx` here.  By the time the SDK invokes canUseTool for a
+  // mid-stream `AskUserQuestion`, at least one of those events has fired in
+  // the current turn and `current` is set.
+  //
+  // # Cross-session caveat
+  //
+  // Pi has one UI per process; a single ExtensionContext.ui works across
+  // sessions.  But `ctx` itself carries session-scoped fields (cwd,
+  // sessionManager, model, abort signal) which can be stale if we hold it
+  // across a session switch.  For UI overlay purposes (`ctx.ui.custom`),
+  // staleness is harmless — pi's TUI is process-wide.  If we ever start
+  // using session-scoped fields from the captured ctx, we'll need
+  // per-session tracking.
+  const ctxRef: { current?: ExtensionContext } = {};
 
   // Optional HTTP log proxy.  Same lifecycle as before: lazy-start, point the
   // subprocess at it via env, forward to whichever upstream we end up using.
@@ -371,6 +399,21 @@ export function registerProvider(pi: ExtensionAPI): void {
     }
     return undefined;
   });
+
+  // Capture the latest ExtensionContext so the SDK's canUseTool callback
+  // (see `interactive-tools.ts`) can render pi-tui UI.  See `ctxRef`
+  // docstring above.  We subscribe to several early-firing events so we
+  // have a fresh ctx by the time any interactive tool_use arrives.
+  const captureCtx = (_event: unknown, ctx: ExtensionContext) => {
+    ctxRef.current = ctx;
+  };
+  pi.on("before_agent_start", captureCtx);
+  pi.on("turn_start", captureCtx);
+  pi.on("message_start", captureCtx);
+  pi.on("tool_execution_start", captureCtx);
+  // Expose the getter so the SDK options builder (in ensureSession) can
+  // attach `canUseTool` without holding the ctxRef closure directly.
+  config.getLatestCtx = () => ctxRef.current;
 
   // Lifecycle: tear down on shutdown / fork / compact.  See module docstring.
   registerLifecycleHooks(pi, config);
@@ -1040,6 +1083,20 @@ async function ensureSession(
     // surfaced — see writeups/subagent_investigation.md "Phase B" for the
     // path to nested-transcript rendering.
     tools: { type: "preset", preset: "claude_code" },
+    // Permission hook for SDK-side "client-side" tools (AskUserQuestion in
+    // particular).  Without this, the SDK's `checkPermissions()` for
+    // AskUserQuestion returns `behavior: "ask"` with no host to handle
+    // the question, and the SDK synthesizes an `is_error` tool_result with
+    // content="Answer questions?" — the model interprets that as a user
+    // cancellation.
+    //
+    // Our handler dispatches: for AskUserQuestion, render a pi-tui dialog
+    // and return the user's selections in `updatedInput.answers`; for any
+    // other prompt the SDK might raise, default-allow with the original
+    // input.  See `interactive-tools.ts` module docstring for limitations
+    // (no per-tool generic-permission UI yet).
+    canUseTool: (toolName, input, opts) =>
+      handleCanUseTool(toolName, input, opts, () => config.getLatestCtx?.()),
     ...(resumeId ? { resume: resumeId } : {}),
     ...(fastFrag.extraArgs ? { extraArgs: fastFrag.extraArgs } : {}),
     effort: mapEffort(options?.reasoning),

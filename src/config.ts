@@ -87,6 +87,22 @@ export interface ProviderConfig {
    */
   registerDynamicStub?: (toolName: string) => void;
   /**
+   * Returns the most-recently-seen {@link ExtensionContext}, or undefined
+   * if no event handler has fired yet.  Set by `registerProvider`; consumed
+   * by `ensureSession` to construct the SDK's `canUseTool` hook (see
+   * `interactive-tools.ts`).
+   *
+   * The getter pattern (vs. a direct `ctx` field) is important because we
+   * want the SDK to see the LATEST ctx at the moment it invokes
+   * `canUseTool`, not the one that happened to be set at session-spawn
+   * time — ctx may be refreshed between turns, after compaction, etc.
+   *
+   * Returns `undefined` if pi-cas is running before any event has fired,
+   * or if pi is in a headless mode where no UI context exists.  Callers
+   * should fall back to `behavior: "deny"` in that case.
+   */
+  getLatestCtx?: () => import("@earendil-works/pi-coding-agent").ExtensionContext | undefined;
+  /**
    * Fork bookkeeping: when pi forks a session, the `session_before_fork`
    * handler calls `forkSession()` on the SDK to create a forked copy of the
    * current SDK session and stashes the result here.  The next
