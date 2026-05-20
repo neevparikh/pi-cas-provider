@@ -152,8 +152,7 @@ interface PiSession {
   genWaker: (() => void) | null;
   /** Signals the gen to return (clean shutdown). */
   ended: boolean;
-  /** A `result` arrived but the consumer hasn't read it yet — set/cleared per-turn. */
-  inFlight: boolean;
+
   cwd: string;
   /** Last-known model id for change detection across turns. */
   model: string;
@@ -450,9 +449,15 @@ function streamViaSDK(
       );
     }
 
-    if (classification.unexpectedToolResultIds.length > 0 && DEBUG) {
-      console.error(
-        `[pi-cas/debug] WARN: unexpected toolResult ids (not in recently-emitted set): ` +
+    if (classification.unexpectedToolResultIds.length > 0) {
+      // Visible without DEBUG: this means pi is feeding us tool results
+      // we don't recognize as ours.  Either a pi extension is injecting
+      // them, the recently-emitted set is stale (e.g., process restart
+      // mid-turn), or there's a bug in classification.  Either way it
+      // signals divergence between pi's and the SDK's view of which tools
+      // ran, so operators need to know in production.
+      console.warn(
+        `[pi-cas] unexpected toolResult ids (not in recently-emitted set): ` +
           classification.unexpectedToolResultIds.join(", "),
       );
     }
@@ -508,7 +513,6 @@ function streamViaSDK(
     // and cost calculation reflect any mid-session model switch we applied
     // above (session.query.setModel).
     session.bridge.attachStream(stream, model);
-    session.inFlight = true;
     try {
       if (enqueuePromise) {
         // Wait until the gen has actually yielded our message before we
@@ -548,14 +552,35 @@ function streamViaSDK(
       }
 
       if (!session.bridge.isSegmentReady() && session.bridge.isTurnDone()) {
-        // Turn ended without any assistant message (empty / error turn).
-        // Synthesize an empty done and rearm the bridge for the next turn.
-        if (DEBUG) console.error("[pi-cas/debug] turn ended without segment; pushing empty done");
-        const empty = makeEmptyAssistantMessage(model);
-        stream.push({ type: "done", reason: "stop", message: empty } as any);
-        stream.end();
+        // Turn ended without a completed assistant segment.  Three sub-cases:
+        //   (a) SDK reported an error result (auth failure, rate limit,
+        //       server 5xx): surface the error to pi.
+        //   (b) The bridge had started a segment (`message_start` arrived,
+        //       maybe with partial content/tool_use blocks) but the turn
+        //       ended before message_stop — partial content + error.
+        //   (c) Truly empty no-op turn (no message_start at all and no
+        //       error): synthesize an empty done.  This is the original
+        //       behavior for empty continuation turns.
+        const turnErr = session.bridge.getTurnError();
+        const hadPartial = session.bridge.hasPartialContent();
+        if (turnErr || hadPartial) {
+          const errMsg =
+            turnErr ??
+            "SDK turn ended without completing the assistant message (no error reported)";
+          if (DEBUG) {
+            console.error(
+              `[pi-cas/debug] turn ended without complete segment — ` +
+                `surfacing error: ${errMsg}`,
+            );
+          }
+          pushError(stream, model, errMsg);
+        } else {
+          if (DEBUG) console.error("[pi-cas/debug] turn ended without segment; pushing empty done");
+          const empty = makeEmptyAssistantMessage(model);
+          stream.push({ type: "done", reason: "stop", message: empty } as any);
+          stream.end();
+        }
         session.bridge.resetTurn();
-        session.inFlight = false;
         return;
       }
 
@@ -587,14 +612,12 @@ function streamViaSDK(
     } catch (err: any) {
       if (DEBUG) console.error(`[pi-cas/debug] consume loop threw:`, err);
       pushError(stream, model, err?.message ?? String(err));
-      session.inFlight = false;
       return;
     } finally {
       if (options?.signal) {
         options.signal.removeEventListener("abort", abortListener);
       }
     }
-    session.inFlight = false;
 
     // 7. Fast-mode state + badge update.
     const fms = session.bridge.getFastModeState();
@@ -768,22 +791,8 @@ async function ensureSession(
   // can't use `for await`-with-break across multiple turns.
   const iter = (q as any)[Symbol.asyncIterator]() as AsyncIterator<any>;
 
-  // Determine where the "new" content starts in pi's transcript:
-  //   - Resumed SDK session: the SDK already has all prior turns in its
-  //     own JSONL.  We must NOT replay the historical pi messages — that
-  //     would re-enqueue every user prompt the SDK already saw.  Pi's
-  //     calling convention is that the trailing message in context.messages
-  //     is the user input prompting THIS streamSimple call, so skip
-  //     everything before that.
-  //   - Fresh SDK session with no pi history: messages.length is 0 or 1
-  //     and the formula gives 0.
-  //   - Fresh SDK session WITH pi history (e.g. pi resumed a session that
-  //     was previously routed through a different provider): we have no
-  //     good answer.  Sending all prior user messages without their
-  //     assistant pairs would mislead the model into thinking it had
-  //     responded.  Sending only the trailing message loses context but
-  //     is consistent.  Documented as a known limitation in writeups.
-  const initialLastSent = Math.max(0, context.messages.length - 1);
+  // Initial lastSentCount: see initialLastSentCount() for the rationale.
+  const initialLastSent = initialLastSentCount(context.messages.length);
 
   const session: PiSession = {
     piSessionId,
@@ -795,7 +804,6 @@ async function ensureSession(
     promptQueue,
     genWaker: null,
     ended: false,
-    inFlight: false,
     cwd,
     model: model.id,
     permissionMode: config.permissionMode,
@@ -859,6 +867,36 @@ function buildSubprocessEnv(
     if (config.baseUrlOverride) env.ANTHROPIC_BASE_URL = config.baseUrlOverride;
   }
   return env;
+}
+
+/* ----------------------------- session bootstrap helpers ----------------------------- */
+
+/**
+ * Compute the initial `lastSentCount` for a freshly-spawned PiSession.
+ *
+ * On session creation we need to decide: which of pi's messages have
+ * "already been sent" to the SDK?
+ *
+ *   - **Resumed SDK session** (`resume: <id>` passed to `query()`): the SDK
+ *     already has all prior turns in its own JSONL.  Replaying historical
+ *     pi messages would re-enqueue every user prompt the SDK already saw.
+ *     Pi's calling convention guarantees the trailing message in
+ *     `context.messages` IS the user input prompting THIS streamSimple call
+ *     — so mark everything before that as already consumed.
+ *   - **Fresh SDK session, no pi history**: messages.length is 0 or 1,
+ *     and the formula gives 0; the trailing message (if any) is enqueued.
+ *   - **Fresh SDK session WITH pi history** (e.g. pi switched providers
+ *     mid-conversation): no good answer.  Sending all prior user messages
+ *     without their assistant pairs would mislead the model into thinking
+ *     it had responded.  Sending only the trailing message loses context
+ *     but is consistent.  Documented as a known limitation in writeups.
+ *
+ * The previous value (`0`) caused a real bug on cross-process resume: the
+ * provider would double-send every historical user prompt to the SDK.
+ * Exported for unit testing.
+ */
+export function initialLastSentCount(piMessagesLength: number): number {
+  return Math.max(0, piMessagesLength - 1);
 }
 
 /* ----------------------------- message classification ----------------------------- */

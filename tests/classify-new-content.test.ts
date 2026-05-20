@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { classifyNewContent } from "../src/provider.js";
+import { classifyNewContent, initialLastSentCount } from "../src/provider.js";
 
 const recent = (...ids: string[]) => new Set(ids);
 
@@ -181,13 +181,32 @@ describe("classifyNewContent", () => {
     expect(r.realUserBlocks).toEqual([{ type: "text", text: "next" }]);
   });
 
-  it("toolResult embedded inside user message content array is also classified", () => {
+  it("toolResult embedded inside user message content array is also classified (toolCallId key)", () => {
     const r = classifyNewContent(
       [
         {
           role: "user",
           content: [
             { type: "toolResult", toolCallId: "tu-1", content: [{ type: "text", text: "x" }] },
+          ],
+        },
+      ],
+      0,
+      recent("tu-1"),
+    );
+    expect(r.kind).toBe("phantom");
+    expect(r.phantomToolResultIds).toEqual(["tu-1"]);
+  });
+
+  it("H3: embedded tool_result block with Anthropic-shape tool_use_id key is also classified", () => {
+    // The write_up explicitly calls out dual-key acceptance for forward compat.
+    // This exercises the `block.toolCallId ?? block.tool_use_id` fallback.
+    const r = classifyNewContent(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "tu-1", content: [{ type: "text", text: "x" }] },
           ],
         },
       ],
@@ -209,6 +228,47 @@ describe("classifyNewContent", () => {
     );
     expect(r.kind).toBe("real");
     expect(r.realUserBlocks).toEqual([{ type: "text", text: "new message" }]);
+  });
+
+  it("M5: initialLastSentCount with empty pi history returns 0 (fresh session, first turn)", () => {
+    expect(initialLastSentCount(0)).toBe(0);
+  });
+
+  it("M5: initialLastSentCount with single-message pi context returns 0", () => {
+    // First user message ever — nothing to skip, send everything (one msg).
+    expect(initialLastSentCount(1)).toBe(0);
+  });
+
+  it("M5: initialLastSentCount skips all but the trailing message on resumed pi session", () => {
+    // Cross-process resume: SDK already has the prior transcript;
+    // pi gives us the full history; only the trailing message is new.
+    expect(initialLastSentCount(20)).toBe(19);
+    expect(initialLastSentCount(2)).toBe(1);
+    expect(initialLastSentCount(100)).toBe(99);
+  });
+
+  it("M5: initialLastSentCount clamps at 0 for absurd inputs", () => {
+    // Defensive: even if a caller somehow passes a negative number (e.g.
+    // due to an array math bug elsewhere), we never produce a negative
+    // index that would slice from the end.
+    expect(initialLastSentCount(-1)).toBe(0);
+    expect(initialLastSentCount(-100)).toBe(0);
+  });
+
+  it("M5: combined with classifyNewContent on resumed slice yields only the trailing message", () => {
+    // Simulating the full resume path: pi has a 5-message history, we set
+    // lastSentCount = 4 (the last index), classify reads only message 4.
+    const messages = [
+      { role: "user", content: "old 1" },
+      { role: "assistant", content: [{ type: "text", text: "a" }] },
+      { role: "user", content: "old 2" },
+      { role: "assistant", content: [{ type: "text", text: "b" }] },
+      { role: "user", content: "new" },
+    ];
+    const lastSent = initialLastSentCount(messages.length);
+    const r = classifyNewContent(messages, lastSent, new Set());
+    expect(r.kind).toBe("real");
+    expect(r.realUserBlocks).toEqual([{ type: "text", text: "new" }]);
   });
 
   it("multiple phantoms accumulate", () => {

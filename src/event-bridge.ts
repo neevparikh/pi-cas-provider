@@ -100,6 +100,16 @@ export interface EventBridge {
    * consume loop doesn't see stale `turnDone=true`. */
   resetTurn(): void;
 
+  /** Captured error message from a turn-level `result` with `is_error: true`
+   * (auth failure, rate limit, etc.).  Undefined if the turn ended normally. */
+  getTurnError(): string | undefined;
+
+  /** True if the bridge has accumulated any per-segment state (a `start`
+   * has been pushed to the pi stream and/or content blocks have started
+   * arriving).  Used to decide whether to emit partial content alongside
+   * an error or just push an error event. */
+  hasPartialContent(): boolean;
+
   /** Get the pi-flavored stop reason for the current segment. */
   getSegmentStopReason(): PiStopReason;
 
@@ -133,6 +143,7 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
   let sdkSessionId: string | undefined;
   let fastModeState: "off" | "cooldown" | "on" | undefined;
   let cost: number | undefined;
+  let turnError: string | undefined;
 
   // Per-segment state — reset on each new Anthropic message_start.
   let stream: AssistantMessageEventStream | undefined;
@@ -192,12 +203,22 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
     // SDK reports each tool's result back via a `user` SDKUserMessage whose
     // content array contains tool_result blocks.  Cache them keyed by
     // tool_use_id; clear the pending set entry.
+    //
+    // SDKUserMessage.tool_use_result is singular (one structured detail per
+    // SDKUserMessage) and the SDK in practice sends one tool_result content
+    // block per message.  We assert that pairing here: tool_use_result is
+    // only attached to the FIRST tool_result block.  Subsequent blocks (if
+    // any — not observed in current SDK behavior) get undefined details to
+    // avoid silently cross-attributing structured details from tool A to
+    // tool B.
     if (msg.type === "user") {
       const c = msg.message?.content;
       if (Array.isArray(c)) {
+        let first = true;
         for (const block of c) {
           if (block.type === "tool_result") {
-            ingestToolResult(block, msg.tool_use_result);
+            ingestToolResult(block, first ? msg.tool_use_result : undefined);
+            first = false;
           }
         }
       }
@@ -216,6 +237,21 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
       if (msg.fast_mode_state) fastModeState = msg.fast_mode_state;
       if (msg.usage) updateUsage(msg.usage);
       turnDone = true;
+      if (msg.is_error === true) {
+        // SDK signaled a turn-level error (auth failure, rate limit, server
+        // 5xx, etc.).  Capture a human-readable message so the provider can
+        // surface it instead of pushing an empty successful done.
+        const subtype = typeof msg.subtype === "string" ? msg.subtype : "error";
+        const inner =
+          typeof msg.result === "string"
+            ? msg.result
+            : typeof msg.error === "string"
+              ? msg.error
+              : typeof msg.error?.message === "string"
+                ? msg.error.message
+                : JSON.stringify(msg.result ?? msg.error ?? {}).slice(0, 500);
+        turnError = `[${subtype}] ${inner}`.trim();
+      }
       return;
     }
   }
@@ -516,8 +552,16 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
       // Called by the provider after consuming a turn-final `result` event,
       // so a subsequent streamSimple call for a new turn starts cleanly.
       // Per-segment state is already clean post-closeSegment; only the
-      // cross-segment turnDone flag needs clearing.
+      // cross-segment turn-level flags need clearing.
       turnDone = false;
+      turnError = undefined;
+    },
+    getTurnError: () => turnError,
+    /** Whether the bridge has accumulated any partial content for the
+     * current segment.  Used by the provider's error-handling path to
+     * decide whether to surface partial content vs. push an empty error. */
+    hasPartialContent(): boolean {
+      return segmentStarted || output.content.length > 0 || sawAnyContentForSegment;
     },
     handle,
     isSegmentReady,

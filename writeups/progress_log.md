@@ -281,3 +281,66 @@ draining the result event for the next turn.
 ### What's next
 
 Run the review subagents.
+
+---
+
+## Addressed reviewer feedback (3 parallel reviews) 05/19/2026 23:00 - commit (pending)
+
+### Three parallel reviewer subagents found
+
+**autonomous-task-reviewer-with-writeups** flagged five P1/P2 issues addressed in commit 17fd2bd:
+- piBlockToAnthropic silently dropped pi's canonical flat ImageContent shape (the unit test reinforced the wrong shape, hiding the bug)
+- EventBridge captured model at construction; mid-session setModel didn't update bridge's cost calc or output.model
+- Persisted resume + lastSentCount: 0 replayed the full pi transcript to the SDK on cross-process respawn
+- Stub spread entry.details which corrupted string-typed Bash error details into {0:"E",1:"r",...}
+- Stub cache-miss didn't set _piCasIsError, silently rendering an internal failure as successful
+
+**reviewer (code review)** flagged three additional important issues:
+- W1: SDK error results (auth/rate-limit/5xx) were silently swallowed as empty done(stop). Production failures would look like blank successful responses.
+- W2: Mid-message error dropped partial content and produced an inconsistent stream (start → deltas → done(empty)).
+- W3: msg.tool_use_result was applied to every tool_result block in a batched user message, latently cross-attributing tool A's details to tool B if the SDK ever batches.
+- Plus cleanup: dead `inFlight` field, unused `has` import, promote unexpected-id warn to non-DEBUG.
+
+**reviewer (test coverage)** flagged high-priority missing tests:
+- H1: No regression test for the stale-turnDone bug (the actual shipped bug) — three-segment, two-turn sequence
+- H2: No unit test for "turn ended without segment" path (SDK error result)
+- H3: dual-key acceptance (`toolCallId` ?? `tool_use_id`) untested
+- H4: Abort/signal handling untested anywhere
+- M5: initialLastSent formula edge cases untested
+
+### Fixes shipped
+
+**Code:**
+- `event-bridge.ts`:
+  - Added `turnError` state captured from `result.is_error`/`result`/`error`; exposed via `getTurnError()` and `hasPartialContent()` accessors; cleared by `resetTurn()`.
+  - Restructured tool_result ingestion: `tool_use_result` is only attached to the FIRST tool_result block per user SDKUserMessage (defensive against future SDK batching).
+- `provider.ts`:
+  - "Turn ended without segment" branch now distinguishes (a) SDK error → `pushError`, (b) partial-content + no completion → `pushError`, (c) truly empty no-op → empty done.
+  - Removed dead `inFlight` field and all its assignment sites.
+  - Promoted unexpected-toolResult-ids warning from DEBUG-only to always-on `console.warn`.
+  - Extracted `initialLastSentCount(piMessagesLength)` as an exported helper.
+- `stub-tools.ts`:
+  - Removed unused `has` import.
+
+**Tests added (10 new, total 92):**
+- `tests/event-bridge.test.ts`:
+  - H1 regression: stale-turnDone three-segment sequence (turn 1 end_turn → drain result → resetTurn → turn 2 starts cleanly).
+  - H2 (×3): turn-level error before any segment / error after partial content / resetTurn clears turnError.
+- `tests/classify-new-content.test.ts`:
+  - H3: embedded tool_result with Anthropic-shape `tool_use_id` key.
+  - M5 (×5): initialLastSentCount with empty/single/large/negative inputs; combined with classifyNewContent on a 5-message resumed slice.
+- `tests/stub-tools.test.ts`:
+  - String SDK details preserved under `_piCasToolUseResult`.
+  - Structured (object) SDK details spread correctly.
+  - Cache miss propagates `_piCasIsError: true`.
+
+### Deferred
+
+- H4 (abort/signal handling): unit testing requires mocking `@anthropic-ai/claude-agent-sdk`'s `query()`. The probe-refactor-e2e.mjs exercises a session_shutdown teardown but not in-flight abort. Adding a vitest mock of the SDK is significant work for one feature gap. The abort code is small (4 lines wiring options.signal to query.interrupt) and the e2e probes confirm the lifecycle teardown path works. Deferred as a separate hardening task.
+
+### Validation
+
+- `npm run typecheck`: clean.
+- `npm test`: 92/92 pass (was 82).
+- `probe-stub-tools-full.mjs`: passes (3 segments end-to-end).
+- `probe-refactor-e2e.mjs`: 5/5 scenarios pass.

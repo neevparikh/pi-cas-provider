@@ -44,7 +44,7 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 
-import { take, has } from "./tool-result-cache.js";
+import { take } from "./tool-result-cache.js";
 
 const DEBUG = process.env.PI_CAS_DEBUG === "1";
 

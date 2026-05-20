@@ -337,6 +337,98 @@ describe("event-bridge stream-aligned segmentation", () => {
     expect(bridge.getCurrentSegmentToolUseIds()).toEqual([]);
   });
 
+  it("regression (H1): stale turnDone after end_turn segment must not leak into next turn", () => {
+    // The actual bug fixed during dev: after segment 2 closed at end_turn,
+    // the provider drained the SDK's `result` event, which set turnDone=true.
+    // Without resetTurn(), the next streamSimple's consume loop would see
+    // isSegmentReady() true (via stale flags) and return an empty assistant
+    // message for segment 3.  This test exercises the failure shape directly.
+    const bridge = createEventBridge(fakeModel);
+
+    // Turn 1 — single end_turn segment.
+    bridge.attachStream(createAssistantMessageEventStream(), fakeModel);
+    bridge.handle(messageStart());
+    bridge.handle(cbStartText(0));
+    bridge.handle(cbDeltaText(0, "turn 1"));
+    bridge.handle(cbStop(0));
+    bridge.handle(messageDelta("end_turn"));
+    bridge.handle(messageStop());
+    expect(bridge.isSegmentReady()).toBe(true);
+    bridge.closeSegment();
+    // Provider would drain result here:
+    bridge.handle(resultEvent());
+    expect(bridge.isTurnDone()).toBe(true);
+    // Without resetTurn, a new attachStream would observe stale state:
+    bridge.resetTurn();
+    expect(bridge.isTurnDone()).toBe(false);
+
+    // Turn 2 — the formerly-broken segment 3.  Should consume real events,
+    // not exit immediately on stale flags.
+    bridge.attachStream(createAssistantMessageEventStream(), fakeModel);
+    // Before any events, segment is NOT ready and turn is NOT done.
+    expect(bridge.isSegmentReady()).toBe(false);
+    expect(bridge.isTurnDone()).toBe(false);
+    bridge.handle(messageStart());
+    bridge.handle(cbStartText(0));
+    bridge.handle(cbDeltaText(0, "turn 2 content"));
+    bridge.handle(cbStop(0));
+    bridge.handle(messageDelta("end_turn"));
+    bridge.handle(messageStop());
+    expect(bridge.isSegmentReady()).toBe(true);
+    const seg = bridge.closeSegment();
+    expect((seg.content[0] as any).text).toBe("turn 2 content");
+  });
+
+  it("H2: turn-level error result is captured and exposed via getTurnError", () => {
+    const bridge = createEventBridge(fakeModel);
+    bridge.attachStream(createAssistantMessageEventStream(), fakeModel);
+    // SDK reports a turn-level error before ANY assistant message_start
+    // (e.g., auth failure, rate limit during request, server 5xx).
+    bridge.handle({
+      type: "result",
+      subtype: "error_max_turns",
+      is_error: true,
+      result: "rate limit exceeded",
+      total_cost_usd: 0,
+    });
+    expect(bridge.isTurnDone()).toBe(true);
+    expect(bridge.isSegmentReady()).toBe(false);  // no segment ever started
+    expect(bridge.hasPartialContent()).toBe(false);
+    const err = bridge.getTurnError();
+    expect(err).toBeDefined();
+    expect(err).toMatch(/rate limit/i);
+  });
+
+  it("H2: turn-level error after partial content surfaces both error and partial flag", () => {
+    const bridge = createEventBridge(fakeModel);
+    bridge.attachStream(createAssistantMessageEventStream(), fakeModel);
+    bridge.handle(messageStart());
+    bridge.handle(cbStartText(0));
+    bridge.handle(cbDeltaText(0, "streaming started"));
+    // Suppose the connection dropped mid-stream; SDK emits an error result
+    // without ever sending message_stop.
+    bridge.handle({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      error: { message: "connection lost" },
+    });
+    expect(bridge.isTurnDone()).toBe(true);
+    expect(bridge.isSegmentReady()).toBe(false);  // no message_stop arrived
+    expect(bridge.hasPartialContent()).toBe(true);
+    expect(bridge.getTurnError()).toMatch(/connection lost/i);
+  });
+
+  it("H2: resetTurn clears turnError state", () => {
+    const bridge = createEventBridge(fakeModel);
+    bridge.attachStream(createAssistantMessageEventStream(), fakeModel);
+    bridge.handle({ type: "result", is_error: true, result: "x" });
+    expect(bridge.getTurnError()).toBeDefined();
+    bridge.resetTurn();
+    expect(bridge.getTurnError()).toBeUndefined();
+    expect(bridge.isTurnDone()).toBe(false);
+  });
+
   it("mid-session model switch is reflected in output.model and used for cost", () => {
     const bridge = createEventBridge(fakeModel);
     const otherModel = {
