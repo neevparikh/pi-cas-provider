@@ -60,7 +60,11 @@ import { Text } from "@earendil-works/pi-tui";
 import type { Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 
-import { take } from "./tool-result-cache.js";
+import {
+  take,
+  size as cacheSize,
+  keysSnapshot as cacheKeys,
+} from "./tool-result-cache.js";
 
 const DEBUG = process.env.PI_CAS_DEBUG === "1";
 
@@ -129,6 +133,23 @@ const TOOL_METADATA: Record<string, { executionMode: "sequential" | "parallel" }
 };
 
 /**
+ * Tools the SDK runs as "client-side" — they require the host application
+ * to render a UI and provide a user answer.  In subprocess mode (where
+ * pi-cas runs the SDK), the SDK normally surfaces an error tool_result
+ * for these instead of actually rendering UI.  We don't currently provide
+ * a UI bridge for them.
+ *
+ * Listed for diagnostic purposes only — used by {@link executeStub} to
+ * produce a more helpful error message on cache miss.
+ */
+const INTERACTIVE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "AskUserQuestion",
+  "PushNotification",
+  "ExitPlanMode",
+  "EnterPlanMode",
+]);
+
+/**
  * The set of CC built-in tool names we statically pre-register stubs for.
  *
  * Why pre-register everything: see file docstring's "Why pre-register..."
@@ -174,12 +195,22 @@ export async function executeStub(
 }> {
   const entry = take(toolCallId);
   if (!entry) {
-    if (DEBUG) {
-      console.error(
-        `[pi-cas/debug] stub ${toolName}: cache MISS for ${toolCallId} ` +
-          `(this should not happen in normal flow)`,
-      );
-    }
+    // Cache miss — the SDK didn't emit a tool_result for this tool_use by
+    // the time pi's executor reached us, OR something cleared/took our
+    // entry first.  Always log (not just under DEBUG) since it's an
+    // unrecoverable internal error worth a paper trail in production.
+    const otherKeys = cacheKeys();
+    console.error(
+      `[pi-cas] stub ${toolName}: CACHE MISS for ${toolCallId} ` +
+        `(cache.size=${cacheSize()}, other keys=[${otherKeys.join(", ")}])`,
+    );
+    const isInteractive = INTERACTIVE_TOOL_NAMES.has(toolName);
+    const hint = isInteractive
+      ? ` Note: ${toolName} is an interactive tool; pi-cas runs the SDK ` +
+        `in subprocess mode which normally surfaces an error tool_result ` +
+        `for these.  If this keeps happening, run pi with PI_CAS_DEBUG=1 ` +
+        `to capture the bridge's event trace.`
+      : "";
     return {
       content: [
         {
@@ -187,7 +218,7 @@ export async function executeStub(
           text:
             `[pi-cas internal error: no cached result for ${toolName} ` +
             `call ${toolCallId}. The SDK should have produced this result ` +
-            `before pi's loop got here. Please file a bug.]`,
+            `before pi's loop got here. Please file a bug.${hint}]`,
         },
       ],
       // Mark as error so pi-cas's tool_result hook propagates isError=true
@@ -422,7 +453,7 @@ export function renderToolCallText(
  */
 export function formatToolCall(
   toolName: string,
-  args: Record<string, unknown>,
+  rawArgs: unknown,
   theme: Pick<Theme, "fg">,
 ): string {
   const fg = theme.fg.bind(theme);
@@ -431,6 +462,21 @@ export function formatToolCall(
     home && p.startsWith(home) ? `~${p.slice(home.length)}` : p;
   const truncate = (s: string, n: number) =>
     s.length > n ? `${s.slice(0, n)}...` : s;
+
+  // Defensive: `args` may not be a plain object during partial-streaming
+  // (we initialize to `{}` and reparse on each `input_json_delta`, but the
+  // model's incremental JSON can transiently make values weird shapes —
+  // e.g. a partial array whose first complete parse has `questions` as a
+  // string before the full structure arrives).  Every per-tool branch below
+  // should defend against args being undefined/null/primitive/array; we
+  // hoist the safe-getter here.
+  const isObj = (v: unknown): v is Record<string, unknown> =>
+    v !== null && typeof v === "object" && !Array.isArray(v);
+  const isStr = (v: unknown): v is string => typeof v === "string";
+  const args: Record<string, unknown> = isObj(rawArgs) ? rawArgs : {};
+  // Coerce "array-like-but-actually-a-string-or-missing" into a clean
+  // array; lets each branch trust that what it iterates is a real array.
+  const asArray = <T = unknown>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
 
   switch (toolName) {
     /* -- core file/shell tools ------------------------------------- */
@@ -513,10 +559,12 @@ export function formatToolCall(
     }
     /* -- todo list ------------------------------------------------- */
     case "TodoWrite": {
-      const todos = (args.todos as Array<{ status?: string }> | undefined) ?? [];
+      const todos = asArray<unknown>(args.todos);
+      const statusOf = (t: unknown): string | undefined =>
+        isObj(t) && isStr(t.status) ? t.status : undefined;
       const total = todos.length;
-      const inProgress = todos.filter((t) => t?.status === "in_progress").length;
-      const completed = todos.filter((t) => t?.status === "completed").length;
+      const inProgress = todos.filter((t) => statusOf(t) === "in_progress").length;
+      const completed = todos.filter((t) => statusOf(t) === "completed").length;
       const parts = [`${total} todo${total === 1 ? "" : "s"}`];
       if (inProgress > 0) parts.push(`${inProgress} in_progress`);
       if (completed > 0) parts.push(`${completed} done`);
@@ -524,17 +572,20 @@ export function formatToolCall(
     }
     /* -- user prompts ---------------------------------------------- */
     case "AskUserQuestion": {
-      const questions = (args.questions as Array<{ question?: string }> | undefined) ?? [];
+      const questions = asArray<unknown>(args.questions);
       if (questions.length === 0) return fg("muted", "(no questions)");
-      const first = truncate(questions[0]?.question ?? "", 100);
-      let text = fg("accent", first);
+      const firstQuestion = isObj(questions[0]) && isStr(questions[0].question)
+        ? questions[0].question
+        : "";
+      const first = truncate(firstQuestion, 100);
+      let text = first ? fg("accent", first) : fg("muted", "(streaming...)");
       if (questions.length > 1) {
         text += fg("dim", ` (+${questions.length - 1} more)`);
       }
       return text;
     }
     case "PushNotification": {
-      const message = (args.message as string) ?? "";
+      const message = isStr(args.message) ? args.message : "";
       return fg("accent", truncate(message, 120));
     }
     /* -- plan mode ------------------------------------------------- */

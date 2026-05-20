@@ -81,3 +81,12 @@ export function clear(): void {
 export function size(): number {
   return cache.size;
 }
+
+/** Snapshot of current keys — for diagnostics / debug logging.
+ *
+ * Returns last 8 chars of each key (full ids are 30+ chars and clutter logs).
+ * Used by {@link executeStub} to show "this was missing but THESE were
+ * present" on cache-miss errors. */
+export function keysSnapshot(): string[] {
+  return Array.from(cache.keys()).map((k) => k.length > 8 ? `...${k.slice(-8)}` : k);
+}

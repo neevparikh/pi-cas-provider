@@ -269,6 +269,104 @@ describe("formatToolCall", () => {
     expect(s).toContain("42");
   });
 
+  describe("defensive rendering for partial/weird args (no crashes)", () => {
+    // During streaming, `arguments` starts as `{}` and is re-parsed on each
+    // input_json_delta.  Some intermediate parses can leave values in weird
+    // shapes — e.g. `questions` as a string if the model briefly emits a
+    // stringified subobject.  These tests pin the contract that the
+    // renderer NEVER throws and NEVER produces nonsensical output like
+    // `(+335 more)` from a string length.
+
+    it("AskUserQuestion: handles questions=undefined", () => {
+      const s = formatToolCall("AskUserQuestion", {}, noopTheme);
+      expect(s).not.toMatch(/\+\d+ more/);
+      expect(s).toMatch(/no questions/);
+    });
+
+    it("AskUserQuestion: handles questions as a string (NOT an array)", () => {
+      // This is the shape that caused the original `(+335 more)` bug — a
+      // 336-char string that the model emitted as the questions value
+      // before streaming completed.
+      const stringy = "x".repeat(336);
+      const s = formatToolCall("AskUserQuestion", { questions: stringy }, noopTheme);
+      expect(s).not.toMatch(/\+\d+ more/);
+      // Should fall back to "no questions" since it's not an array.
+      expect(s).toMatch(/no questions/);
+    });
+
+    it("AskUserQuestion: handles questions as an empty array", () => {
+      const s = formatToolCall("AskUserQuestion", { questions: [] }, noopTheme);
+      expect(s).toMatch(/no questions/);
+    });
+
+    it("AskUserQuestion: handles questions[0] missing the question field", () => {
+      const s = formatToolCall("AskUserQuestion", { questions: [{}, {}] }, noopTheme);
+      // First question text is empty — should show streaming placeholder + count.
+      expect(s).toMatch(/streaming/);
+      expect(s).toMatch(/\+1 more/);
+    });
+
+    it("AskUserQuestion: handles questions[0] as a string (not an object)", () => {
+      const s = formatToolCall(
+        "AskUserQuestion",
+        { questions: ["foo", "bar"] },
+        noopTheme,
+      );
+      // questions[0] is a string — isObj fails, falls back gracefully.
+      expect(s).toMatch(/streaming|no questions/);
+      // Should NOT crash or produce numeric character keys.
+    });
+
+    it("TodoWrite: handles todos=undefined / wrong shape", () => {
+      expect(formatToolCall("TodoWrite", {}, noopTheme)).toMatch(/0 todos/);
+      expect(formatToolCall("TodoWrite", { todos: "x" }, noopTheme)).toMatch(/0 todos/);
+      expect(formatToolCall("TodoWrite", { todos: ["str", null] }, noopTheme)).toMatch(/2 todos/);
+    });
+
+    it("all tools: tolerate args being null / string / array / undefined", () => {
+      // Every tool name should produce SOME string output without throwing,
+      // even when args isn't a plain object.
+      const names = [
+        "Bash",
+        "Read",
+        "Write",
+        "Edit",
+        "Grep",
+        "Glob",
+        "WebFetch",
+        "WebSearch",
+        "NotebookEdit",
+        "TodoWrite",
+        "AskUserQuestion",
+        "PushNotification",
+        "ExitPlanMode",
+        "EnterPlanMode",
+        "Skill",
+        "ScheduleWakeup",
+        "Monitor",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "EnterWorktree",
+        "ExitWorktree",
+        "TaskCreate",
+        "TaskGet",
+        "TaskList",
+        "TaskUpdate",
+        "TaskStop",
+        "TaskOutput",
+        "Task",
+        "Agent",
+        "SomeUnknownTool",
+      ];
+      for (const weird of [undefined, null, "a string", [], ["x"], 42]) {
+        for (const name of names) {
+          expect(() => formatToolCall(name, weird as unknown, noopTheme)).not.toThrow();
+        }
+      }
+    });
+  });
+
   it("home directory paths are shortened to ~", () => {
     const home = process.env.HOME ?? "";
     if (!home) return; // skip in unusual environments
