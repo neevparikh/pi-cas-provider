@@ -344,3 +344,68 @@ Run the review subagents.
 - `npm test`: 92/92 pass (was 82).
 - `probe-stub-tools-full.mjs`: passes (3 segments end-to-end).
 - `probe-refactor-e2e.mjs`: 5/5 scenarios pass.
+
+---
+
+## Addressed choices + dead-code + documentation reviews 05/19/2026 23:40 - commit (pending)
+
+### Three reviewers in this pass
+
+**Choices reviewer**: assessed 10 non-obvious choices.  All sound; flagged:
+- Choice #3 (restricted tool surface): brittle vs future CC tools \u2014 catch-all stub as Open Path #4.
+- Choice #7 (initialLastSentCount): no signal when fresh-session-with-pi-history loses context.
+- Choice #8 (surface SDK errors): partial content was being discarded by pushError; need to flush it first.
+- Choice #10 (warn promotion): rate-limiting risk if extensions inject many unexpected ids.
+
+**Dead-code reviewer**: flagged:
+- `event-bridge.ts` `msg.type === 'assistant'` handler + `appendFinalBlock` are unreachable with `includePartialMessages: true` (kept as defensive).
+- `tool-result-cache.ts` `has`/`clear`/`size` exported but only test-imported (kept; test-only is fine).
+- `stub-tools.ts` `terminate?: boolean` field unused in return type \u2014 removed.
+- `stub-tools.ts` `SupportedCcToolName` only internal (exported anyway; small).
+- `provider.ts` `_model` unused param in `buildSubprocessEnv` \u2014 removed.
+- `provider.ts` `emit()` had two unused params (`_pi`, `_customType`) \u2014 removed.
+
+**Documentation reviewer**: ~35 stale claims, mostly in README.md describing the pre-refactor architecture.  Major rewrites required for:
+- "What you get" bullets (stub tools, restricted tool surface, fast-mode-at-spawn semantics)
+- Auth table (3 states + okta path, not 2)
+- "How it works" architecture diagram + bullets (was stale from Option A; now describes segmentation + stubs + phantom detection)
+- Tested / Known caveats (94 tests, multi-segment probe, restricted-tool surface, live-config-change limits, provider-switch context loss)
+- Development section (94 tests, updated probe filenames)
+- Fast mode caveats (~30x \u2192 ~2x; mid-conversation toggle clarification)
+- Okta-relay mode (relay resolved at spawn, not per-turn)
+- Removed retired UI-badge section (event bus is the only mechanism now)
+- Removed duplicate `/cas-perm` row in slash-commands table
+- writeups: test count 77 \u2192 94, commit hashes updated
+- src/provider.ts top-of-file docstring: corrected the "never feeds history via --resume" claim
+- continuation_context.md: status updated; H4 abort/signal hardening + catch-all stub listed as deferred
+
+### Fixes shipped (this pass)
+
+**Code:**
+- `event-bridge.ts`: added `closeStreamWithError(message)` + `getPartialOutput()` accessors so the provider's error path preserves partial content streamed before the error.  Otherwise pi's UI showed text appear and then vanish on SDK error.
+- `provider.ts`: error-path now calls `bridge.closeStreamWithError(msg)` instead of `pushError`, preserving partial content.
+- Removed `_model` param from `buildSubprocessEnv` and `_pi`/`_customType` from `emit()`.
+- Removed `terminate?: boolean` from `executeStub` return type (always unset).
+- Source-level docstring in `provider.ts` corrected (resume + teardown).
+
+**Tests added:**
+- 2 new tests for `closeStreamWithError`: preserves partial text content; works with no partial content.
+
+**Writeups + README:**
+- `README.md`: major rewrite of "What you get", "How it works", "Status & known issues", "Development", "Fast mode caveats", "UI/Event-bus", "Okta-relay mode". Auth table now 3 states. Duplicate slash-command row removed.
+- `writeups/write_up.md`: added "Error handling" section; added cross-process resume + fresh-session-with-pi-history paragraph; added Known Limitations bullet for the latter.
+- `writeups/continuation_context.md`: status + test count updated; H4 + catch-all stub added to deferred list.
+
+### Validation
+
+- `npm run typecheck`: clean.
+- `npm test`: 94/94 (was 92 before this pass).
+- `probe-stub-tools-full.mjs`: 3 segments end-to-end against real Anthropic API.
+- `probe-refactor-e2e.mjs`: 5/5 scenarios pass.
+
+### Deferred (still open)
+
+- H4: abort/signal unit tests (require SDK mocking).
+- Catch-all stub for unknown CC tool names (Open path #4 in write_up.md).
+- Provider-switch context-loss warning (Choice #7 review suggestion).
+- Rate-limiting unexpected-id warnings (Choice #10 review suggestion; low priority).

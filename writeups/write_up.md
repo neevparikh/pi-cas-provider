@@ -36,13 +36,21 @@ section for what this replaced.)
   `--resume <id>` to reattach to the SDK's prior conversation.  In that
   case the SDK already has the full transcript internally, so pi-cas
   initializes `lastSentCount = max(0, context.messages.length - 1)` on
-  session creation to mark all but the trailing user message as
-  already-consumed.  Without this, classifyNewContent would re-enqueue
-  every historical user message to the SDK, double-sending them.  The
-  normalizer pain doesn't reappear in practice because the SDK's own
-  JSONL is a clean record of its own emissions — the original bug came
-  from pi-cas synthesizing transcripts to feed the SDK, which we no
-  longer do.
+  session creation (see `initialLastSentCount` in provider.ts) to mark
+  all but the trailing user message as already-consumed.  Without this,
+  classifyNewContent would re-enqueue every historical user message to
+  the SDK, double-sending them.  The normalizer pain doesn't reappear
+  in practice because the SDK's own JSONL is a clean record of its own
+  emissions — the original bug came from pi-cas synthesizing transcripts
+  to feed the SDK, which we no longer do.
+- **Fresh session with pre-existing pi history.**  If pi has a non-empty
+  transcript but pi-cas has no persisted SDK session id (e.g. user
+  switched providers mid-conversation), `initialLastSentCount` still
+  returns N-1, so only the trailing user message reaches the SDK.
+  The prior context is lost from the SDK's view.  The alternative —
+  sending all prior user messages without their assistant pairs — would
+  mislead the model into thinking it had already responded, so we accept
+  the loss.  See Known Limitations.
 
 ### Layer 2 — Stream-aligned segmentation + stub tools
 
@@ -186,6 +194,27 @@ tests/                     — vitest suites for each module:
                              classify-new-content, persistence, relay,
                              http-log-proxy, thinking.
 ```
+
+## Error handling
+
+The consume loop in `streamViaSDK` distinguishes three turn-end cases
+when the SDK emits `result` without a completed segment:
+
+1. **Error result + partial content**: the SDK started streaming an
+   assistant message, then failed (rate limit mid-turn, dropped
+   connection, etc.).  `bridge.closeStreamWithError(msg)` emits an
+   `error` event carrying whatever partial content already streamed,
+   so pi can render the prefix the user saw on screen alongside the
+   error.  Without this, the user would see text appear then vanish.
+2. **Error result, no segment ever started**: e.g. auth failure, billing
+   error, or 4xx/5xx before any assistant content.  Same
+   `closeStreamWithError` path, but content is empty.
+3. **Empty result (no error, no segment)**: rare no-op continuation;
+   we synthesize an empty `done(stop)`.
+
+The bridge captures the error message from `msg.result` / `msg.error`
+on SDK `result` events with `is_error: true`; the provider reads it via
+`bridge.getTurnError()` and `bridge.hasPartialContent()`.
 
 ## Known limitations
 

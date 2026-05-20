@@ -9,8 +9,13 @@
  * **Layer 1 — long-lived query() per pi session** (carried over from
  * Option A): avoids the bundled `claude` binary's resume normalizer
  * (`gG8 → iO6 → Xg5`) on every turn.  Pi-cas spawns ONE `query()` per pi
- * session and reuses it forever.  The SDK manages its own JSONL transcript
- * internally; pi-cas never feeds history back via `--resume`.
+ * session and reuses it forever.  Within a single pi process, pi-cas does
+ * not invoke `--resume`; turn-to-turn history is held internally by the
+ * SDK.  ACROSS pi processes, when a persisted SDK session id exists from
+ * a prior run, the FIRST `query()` does use `--resume <id>` to reattach.
+ * In that case `ensureSession` sets `lastSentCount = max(0, n-1)` so we
+ * don't double-send historical user messages.  See
+ * `initialLastSentCount` for the rationale.
  *
  * **Layer 2 — stream-aligned segmentation + stub tools** (the current
  * refactor): bridges the SDK's multi-message turn (one user input → many
@@ -53,8 +58,8 @@
  *
  * # Lifecycle integration
  *
- *   - `session_shutdown`: tear down the long-lived query (gen.return() +
- *     interrupt()).
+ *   - `session_shutdown`: tear down the long-lived query (wake the
+ *     prompt-iterator gen so it returns + `query.interrupt()`).
  *   - `session_before_fork` / `session_before_compact`: tear down and clear
  *     the pi-session → SDK-session mapping so the next streamSimple spawns
  *     a fresh query (v1 limitation: model history is lost on fork).
@@ -570,10 +575,13 @@ function streamViaSDK(
           if (DEBUG) {
             console.error(
               `[pi-cas/debug] turn ended without complete segment — ` +
-                `surfacing error: ${errMsg}`,
+                `surfacing error (partial=${hadPartial}): ${errMsg}`,
             );
           }
-          pushError(stream, model, errMsg);
+          // Use the bridge's error-close so any partial content already
+          // streamed to pi is preserved in the error message instead of
+          // being discarded.
+          session.bridge.closeStreamWithError(errMsg);
         } else {
           if (DEBUG) console.error("[pi-cas/debug] turn ended without segment; pushing empty done");
           const empty = makeEmptyAssistantMessage(model);
@@ -704,7 +712,7 @@ async function ensureSession(
   }
 
   // Build the env for the subprocess.
-  const env = buildSubprocessEnv(config, model, relay);
+  const env = buildSubprocessEnv(config, relay);
 
   // HTTP log proxy: point the subprocess at it.
   if (logProxyPromise) {
@@ -847,7 +855,6 @@ async function ensureSession(
  */
 function buildSubprocessEnv(
   config: ProviderConfig,
-  _model: Model<any>,
   relay: RelayConfig | undefined,
 ): Record<string, string> {
   const env: Record<string, string> = {};
@@ -1101,9 +1108,7 @@ function pushError(
  * pi.sendMessage — see legacy provider.ts for why).
  */
 function emit(
-  _pi: ExtensionAPI,
   ctx: any,
-  _customType: string,
   text: string,
   kind: "info" | "warning" | "error" = "info",
 ): void {
@@ -1129,7 +1134,7 @@ function registerSlashCommands(
           lastBaseUrl: config.lastOktaBaseUrl,
         },
       });
-      emit(pi, ctx, "pi-cas/auth", text);
+      emit(ctx, text);
     },
   });
 
@@ -1175,7 +1180,7 @@ function registerSlashCommands(
         `  $30/$150 per MTok when active — ~30x standard Opus pricing.\n` +
         `  Preference persisted to ${statePath()}.\n` +
         `  See /cas-auth for entitlement.${envNote}`;
-      emit(pi, ctx, "pi-cas/fast", text);
+      emit(ctx, text);
     },
   });
 
@@ -1249,7 +1254,7 @@ function registerSlashCommands(
           "  listening on `pi-cas:relay-request`. /cas-status shows the last turn.",
         );
       }
-      emit(pi, ctx, "pi-cas/okta", detail.join("\n"));
+      emit(ctx, detail.join("\n"));
     },
   });
 
@@ -1265,9 +1270,7 @@ function registerSlashCommands(
       const arg = args.trim();
       if (!arg || arg === "status") {
         emit(
-          pi,
           ctx,
-          "pi-cas/perm",
           `pi-cas permission mode: ${config.permissionMode}\n` +
             `  Default for new sessions.  Mutable per-session via this command.\n` +
             `  Env override: PI_CAS_PERMISSION_MODE.\n` +
@@ -1278,9 +1281,7 @@ function registerSlashCommands(
       const parsed = parsePermissionMode(arg);
       if (!parsed) {
         emit(
-          pi,
           ctx,
-          "pi-cas/perm",
           `Unknown permission mode: ${arg}\n` +
             `Valid: bypassPermissions, default, acceptEdits, plan`,
           "error",
@@ -1300,9 +1301,7 @@ function registerSlashCommands(
         }
       }
       emit(
-        pi,
         ctx,
-        "pi-cas/perm",
         `pi-cas permission mode → ${parsed} (saved, was ${prev})\n` +
           `  Applied to ${config.sessions.size} active session(s).`,
       );
@@ -1352,7 +1351,7 @@ function registerSlashCommands(
           lines.push("  - Does the relay have fast-mode entitlement on its upstream Console org?");
         }
       }
-      emit(pi, ctx, "pi-cas/status", lines.join("\n"));
+      emit(ctx, lines.join("\n"));
     },
   });
 }

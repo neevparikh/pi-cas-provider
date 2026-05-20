@@ -9,14 +9,20 @@ The motivating use case is **[Claude Code fast mode](https://code.claude.com/doc
 on Opus 4.6 / 4.7 — a premium-rate, lower-latency inference path that is only reachable
 through Claude Code's settings layer, not the raw Messages API.
 
-> **Anthropic Terms of Service — billing mode matters.** Claude Code's `/login`
-> can land you in one of two auth states. Only one is appropriate for this provider:
+> **Anthropic Terms of Service — billing mode matters.** Claude Code's auth can land
+> you in one of three states; the first two bill at Console / API rates and are
+> appropriate for this provider, the third is not:
 >
 > | Auth state | Billing | OK for this provider? |
 > |---|---|---|
 > | `ANTHROPIC_API_KEY` env var (Console key) | Anthropic Console / API rates | **Yes** |
 > | `claude /login` → Anthropic Console (managed key) | Anthropic Console / API rates | **Yes** |
 > | `claude /login` → Claude.ai (Pro / Max / Team subscription) | Your subscription | **No** — those credentials are TOS-scoped to Claude Code as a product |
+>
+> A fourth path is **okta-relay mode** (`/cas-okta on`): pi-cas asks another
+> extension for OAuth-issued credentials before each turn and bypasses local
+> Claude Code auth entirely.  See the okta-relay section below; the TOS warning
+> doesn't apply when the relay's upstream account is API-billed.
 >
 > `/cas-auth` classifies your current state explicitly. The provider does not refuse
 > to run on subscription auth (it can't — the actual API call happens inside the
@@ -26,31 +32,33 @@ through Claude Code's settings layer, not the raw Messages API.
 
 ## What you get
 
-- **Real Claude Code agent semantics.** Tools (Read/Write/Edit/Bash/Grep/Glob), the
-  Claude Code system prompt preset behavior, sessions and conversation history all
-  flow through the Agent SDK rather than being approximated.
+- **Six Claude Code built-in tools.** Bash, Read, Write, Edit, Grep, Glob.
+  The SDK runs them natively inside the bundled `claude` subprocess; pi-cas
+  registers stub pi tools matching the CC names so pi's agent loop can
+  display each tool call and its result, but the actual execution happens
+  inside the SDK.  Other CC tools (WebFetch, Agent, NotebookEdit, skill
+  activations, etc.) are NOT exposed to the model in this provider.
 - **Fast mode opt-in.** A slash command (`/cas-fast on`) or env var
-  (`PI_CAS_FAST_MODE=1`) flips fast mode for Opus turns. The provider warns once per
-  session if you request fast mode and the API returns `fast_mode_state: off` (e.g.,
-  if your org doesn't have extra usage enabled).
-- **SDK-owned history.** The SDK subprocess maintains its own clean JSONL
-  transcript across the session. Pi-cas extracts new user input from pi's
-  message list per turn and enqueues into the long-lived prompt iterable;
-  the SDK handles everything else (model calls, tool execution, history
-  replay across multi-step turns).
-- **SDK-native tool execution.** The bundled `claude` subprocess runs all
-  built-in tools (Read/Write/Edit/Bash/Grep/Glob/...) directly via
-  `permissionMode: "bypassPermissions"`. Pi-cas forwards `tool_use` /
-  `tool_result` stream events to pi for display but does NOT dispatch tools
-  itself. This eliminates the auto-classifier double-execution race that
-  plagued earlier versions, and structurally avoids the "Picking up where I
-  left off" resume-normalizer bug.
-- **Long-lived `query()` per pi session.** One SDK subprocess lives for the
-  whole pi session, with the prompt as an `AsyncIterable<SDKUserMessage>`
-  the streamSimple loop enqueues into per turn. No `--resume`, no on-disk
-  JSONL replay, no resume normalizer involvement.
-- **Inherits Claude Code auth.** No separate login flow; whatever `claude auth status`
-  reports is what this provider uses.
+  (`PI_CAS_FAST_MODE=1`) flips fast mode for Opus turns. Fast mode is only
+  picked up at SDK-session spawn time, so toggling it mid-session takes
+  effect on the next pi session (or when the SDK session is recreated
+  e.g. via fork/compact).  The provider warns once per session if you
+  request fast mode and the API returns `fast_mode_state: off`.
+- **Long-lived `query()` per pi session.** One SDK subprocess lives for
+  the whole pi session, with the prompt as an `AsyncIterable<SDKUserMessage>`
+  the streamSimple loop enqueues into per turn.  Within a pi process,
+  pi-cas does not invoke `--resume`; turn-to-turn history is held in the
+  SDK's in-memory state.  Across pi processes, the FIRST query DOES use
+  `--resume <id>` to reattach to a persisted SDK session.
+- **Stream-aligned segmentation.** Pi sees ONE assistant message per pi
+  `streamSimple` call (matching the natural Anthropic message boundary).
+  Pi's loop runs stubs to retrieve cached SDK results, then loops
+  streamSimple to consume the SDK's continuation message.  See
+  `writeups/write_up.md` for the full architecture.
+- **Inherits Claude Code auth.** No separate login flow; whatever
+  `claude auth status` reports is what this provider uses — unless
+  okta-relay mode is on, in which case credentials come from another
+  extension on the bus.
 
 ## Install
 
@@ -130,9 +138,10 @@ The log records, per request:
 - response status + headers
 - response body (when `PI_CAS_HTTP_LOG_RESPONSES=1`; SSE captured up to 1 MiB)
 
-In okta-relay mode, the proxy follows the relay's URL automatically (the
-upstream is swapped per-turn via `setUpstreamBaseUrl`). When the relay
-changes, a `upstream_changed` entry is emitted.
+In okta-relay mode, the HTTP-log proxy's upstream is set at SDK-session
+spawn time to whatever the relay returned.  If the relay reports a
+different baseUrl on a subsequent spawn, a `upstream_changed` entry is
+emitted.
 
 Quick analysis with `jq`:
 
@@ -174,7 +183,8 @@ This is useful when:
 ### How it works
 
 When `/cas-okta on` is set, pi-cas asks pi's event bus for a relay endpoint
-before each turn:
+the FIRST time it spawns an SDK session per pi process (the relay's
+credentials are baked into the subprocess env at spawn time):
 
 ```
 pi-cas emits  →  pi-cas:relay-request   { requestId, preferredProvider? }
@@ -253,29 +263,13 @@ pi.events.on("pi-cas:relay-request", (raw) => {
 });
 ```
 
-## UI: fast-mode badge
-
-When fast mode is requested, pi-cas displays a `⚡` glyph in pi's footer status
-bar via `ctx.ui.setStatus("pi-cas-fast", …)`. The status entry is keyed, so it
-stacks safely with any other extension's status text — no single-owner
-conflict like `setHeader`/`setFooter`.
-
-The glyph color encodes ground truth:
-
-| Color | Meaning |
-|---|---|
-| bright (`warning`) | API engaged fast mode on the last turn — billing premium |
-| muted | Requested but no turn has completed yet |
-| dim | Requested but the API returned `fast_mode_state: off` — not engaged, no premium charge |
-| red (`error`) | Cooldown — fast-mode pool depleted |
-| (no glyph) | Fast mode is off |
-
 ## Event bus: `pi-cas:fast-mode`
 
-The provider also broadcasts its fast-mode state on pi's inter-extension event
-bus so other extensions can render their own badge wherever they own real
-estate (footer, header, editor border, terminal title, etc.) without touching
-pi-cas internals.
+Pi-cas broadcasts its fast-mode state on pi's inter-extension event bus.
+The event bus is the ONLY badge mechanism in the current release — pi-cas
+does not draw a footer status entry itself.  Subscribers (e.g. `pi-vim`)
+render the badge wherever they own real estate.  If nobody subscribes,
+no glyph appears — that's intentional.
 
 **Channel:** `pi-cas:fast-mode`
 
@@ -325,18 +319,25 @@ To verify what the provider is using, run `/cas-auth`.
 
 ## Fast mode caveats
 
-Fast mode is **~30x more expensive than standard Opus** (~$30 input / $150 output per
-MTok, vs. standard Opus ~$15 / $75). Some sharp edges:
+Fast mode is **roughly 2x more expensive than standard Opus** (~$30 input /
+$150 output per MTok, vs. standard Opus ~$15 / $75). Some sharp edges:
 
 - The provider warns once per session if `fastMode` was requested but the API
   returned `fast_mode_state: off` (org lacks extra-usage entitlement, or model
   doesn't support fast mode).
-- Switching `/cas-fast on` mid-conversation re-bills the **entire prior context**
-  at fast-mode rates. Toggle at session start when possible.
+- `/cas-fast on` only takes effect when the SDK session is (re)spawned
+  (next pi process launch, or after fork/compact tears down the long-lived
+  query).  Toggling mid-conversation in an existing pi process does NOT
+  apply to the current SDK session; the next turn will still use whatever
+  mode the session was spawned with.
+- Switching `/cas-fast on` and starting a new session re-bills the full
+  resumed history at fast-mode rates.  Toggle at session start when possible.
 - Only `claude-opus-4-6` and `claude-opus-4-7` support fast mode. On other models
   the setting is silently ignored.
 
 ## How it works
+
+For the full design see `writeups/write_up.md`.  The high-level shape:
 
 ```
 pi session lifetime
@@ -346,112 +347,140 @@ session_start          (no work — lazy spawn)
                   ▼
 1st streamSimple       spawn query() — long-lived
                           ├─ prompt: AsyncIterable<SDKUserMessage>
+                          ├─ tools: [Bash, Read, Write, Edit, Grep, Glob]
                           ├─ permissionMode: bypassPermissions (default)
-                          └─ subprocess holds session state in-memory + JSONL
+                          └─ resume: <id> IF prior pi run persisted one
                   │
-                  ▼  (enqueue user message, consume events until `result`)
-2nd streamSimple       reuse same query()
-                          ├─ detect model change → query.setModel()
-                          ├─ detect mode change  → query.setPermissionMode()
-                          └─ enqueue user message into same AsyncIterable
+                  ▼  (enqueue real user msg OR detect phantom toolResults)
+consume SDK events     bridge segments one pi assistant message per SDK
+                       assistant message_stop; waits for paired tool_results
+                       before pushing done(toolUse|stop|length).
+                  │
+                  ▼  (pi runs stub tools → cached SDK results)
+2nd streamSimple       same query() — phantom toolResults detected, no
+                       enqueue; provider just consumes the next assistant
+                       segment from the same iterator.
                   │
                   ▼
-3rd, 4th, ...          (same)
+N-th streamSimple      detect model change → query.setModel()
+                       detect mode change  → query.setPermissionMode()
                   │
                   ▼
-session_shutdown       teardown: gen.return() + interrupt()
+session_shutdown       teardown: wake prompt-iterator gen + interrupt()
                        persist sdk_session_id (for next pi launch to resume)
 ```
 
-- One long-lived SDK subprocess per pi session. No `--resume`, no on-disk
-  JSONL replay between turns (the SDK still writes a JSONL transcript for
-  its own bookkeeping, but pi-cas never round-trips through it during the
-  session's lifetime).
-- The SDK runs every tool natively (Bash, Read, Write, Edit, Grep, Glob, ...).
-  Pi-cas forwards `tool_use` and `tool_result` events to pi for display via
-  the streaming protocol; pi does NOT dispatch tools.
-- Per-turn user input is extracted from `context.messages.slice(lastSentCount)`,
-  reduced to user-role content blocks, and yielded into the long-lived prompt
-  iterable. Tool results from pi are ignored (the SDK already saw them
-  internally).
-- The event-bridge resets its content-block index tracking on every Anthropic
-  `message_start` event — necessary because one streamSimple call now spans
-  multiple assistant messages when the model uses tools (text+tool_use →
-  tool ran → final text are each separate Anthropic messages).
+Key points:
+
+- One long-lived SDK subprocess per pi session.
+- Tool execution happens INSIDE the SDK.  Pi-cas registers six stub pi
+  tools (`Bash`/`Read`/`Write`/`Edit`/`Grep`/`Glob`) whose `execute()`
+  retrieves SDK-cached results from a per-session result cache instead
+  of running anything.  Pi's UI sees normal tool calls + results.
+- One pi `streamSimple` produces one pi assistant message, matching one
+  Anthropic assistant message from the SDK.  Multi-turn-with-tools work
+  is split across multiple streamSimple calls driven by pi's loop.
+- When pi runs a stub tool and produces a `toolResult`, the next
+  `streamSimple` recognizes it as a phantom (the SDK already saw the
+  real tool_result internally) and does NOT enqueue it to the SDK — it
+  just consumes the next SDK assistant message from the persistent
+  iterator.
 - The persistent iterator pattern is critical: we capture
   `query[Symbol.asyncIterator]()` ONCE at session creation and reuse it
-  across every turn. Using `for await ... break` would close the generator
-  after the first turn (`iter.return()` is called on early loop exit),
-  preventing subsequent turns from receiving events.
+  across every turn.  Using `for await ... break` would close the
+  generator after the first turn (`iter.return()` is called on early
+  loop exit), preventing subsequent turns from receiving events.
 
 ## Status & known issues
 
 ### Tested
 
-- E2E probe (5 scenarios) against the real `claude` binary + Anthropic API:
-  first turn, tool turn, no-op turn, follow-up after tool, post-shutdown
-  lazy respawn. All pass.
-- Long-lived `query()` survives back-to-back turns including tool use; no
-  resume injection because no `--resume` is used during steady-state.
+- 94 unit tests covering tool-result cache, stub tools, event-bridge
+  segmentation lifecycle, classification + phantom detection, persistence,
+  relay, http-log proxy, and thinking-config helpers.
+- Two end-to-end probes against the real `claude` binary + Anthropic API:
+  - `probe-stub-tools-full.mjs`: drives the full multi-segment flow
+    (tool turn → stub execution → continuation → follow-up question).
+  - `probe-stub-tools.mjs` / `probe-stub-tools-edge.mjs`: low-level SDK
+    event-timing probes (one tool, parallel tools, error tool_result).
+- Long-lived `query()` survives back-to-back turns including tool use;
+  no resume injection within a pi process.
+- Cross-process resume reattaches to a persisted SDK session id and only
+  sends the trailing user message (no double-replay).
 - SDK control APIs (`setModel`, `setPermissionMode`, `interrupt`) work
   mid-session.
 - Auth inheritance via `ANTHROPIC_API_KEY` (Anthropic Console).
 
 ### Known caveats
 
+- **Restricted tool surface.** Only the six CC built-in tools listed above
+  are exposed to the model.  No `WebFetch`, `WebSearch`, `Agent`,
+  `NotebookEdit`, skills, etc.  If a future CC release introduces new
+  default tools, the model loses access to them until pi-cas's
+  `SUPPORTED_CC_TOOL_NAMES` is updated.
 - **Pi permission UI is bypassed.** With the default
   `permissionMode: "bypassPermissions"`, the SDK runs every tool without
-  prompting. Pi's own approval flow / tool-hook extensions are NOT
-  consulted. Switch to `default` mode via `/cas-perm default` if you want
-  the SDK's classifier-+-ask path, but be aware that pi-cas currently does
-  NOT route the resulting `can_use_tool` control requests to a pi UI, so
-  unsafe tool calls will hang. Real pi-UI integration is deferred.
-- **Custom pi tools are not exposed to Claude.** The model only sees Claude
-  Code's built-in tools. Tools registered via `pi.registerTool` or
-  pi-extension MCP servers are invisible. Adding them back requires the
-  pi-tools-as-MCP-bridge design (Design 1 in writeups), deferred.
-- **Pi tool hooks are not translated.** No `beforeToolCall` /
-  `afterToolCall` pi hooks reach the SDK. Could be added later as SDK
-  `PreToolUse` hooks; not implemented in v1.
-- **Cancel latency.** `query.interrupt()` does not propagate into in-flight
-  tool handlers; the current tool must complete before the model's turn
-  stops. For long-running built-in tools (e.g. WebFetch) this can delay
-  user-initiated cancel by tens of seconds.
+  prompting.  Pi's own approval flow / tool-hook extensions are NOT
+  consulted.  Switching to `default` mode via `/cas-perm default` does
+  NOT yet forward `can_use_tool` control requests to pi's UI — unsafe
+  tool calls would hang.  Real pi-UI integration is deferred.
+- **Custom pi tools are not exposed to Claude.** Tools registered via
+  `pi.registerTool` by other extensions or pi-extension MCP servers are
+  invisible to the model.  Adding them back requires a pi-tools-as-MCP
+  bridge; deferred.
+- **Pi tool hooks see stubs, not the SDK.** Pi extension `tool_call` /
+  `tool_result` hooks see the stub execution, but the actual tool has
+  already run inside the SDK by then.  Hooks intended to MODIFY or BLOCK
+  tool arguments don't influence the SDK's execution.  The post-execution
+  `tool_result` hook IS consulted and can adjust pi's view of the result
+  (e.g. isError override).
+- **Live session config changes.** `/cas-fast`, `/cas-okta`, and
+  `PI_CAS_API_KEY` / `PI_CAS_BASE_URL` env overrides only take effect
+  when the SDK session is (re)spawned — not on already-live sessions.
+  `/cas-perm` IS applied live via `query.setPermissionMode()`.
+- **Cancel latency.** `query.interrupt()` does not propagate into
+  in-flight tool handlers; the current tool must complete before the
+  model's turn stops.
 - **Fork/compact loses model history.** When pi forks or compacts the
   session, pi-cas tears down the long-lived SDK subprocess and the next
-  streamSimple spawns fresh with no history. The SDK's `forkSession +
-  resumeSessionAt` support could preserve history; deferred to v2.
+  streamSimple spawns fresh with no history.  The SDK's `forkSession +
+  resumeSessionAt` could preserve history; deferred to v2.
 - **Pollution of `~/.claude/projects/`.** The SDK writes its own JSONL
-  transcript per session under Claude Code's default project dir. Set
+  transcript per session under Claude Code's default project dir.  Set
   `PI_CAS_CLAUDE_CONFIG_DIR` to isolate.
-- **Compaction-summary "Picking back up…" model artifact.** Separate bug
-  (different code path, pre-existing). Not addressed by this refactor and
-  may or may not still occur with SDK-owned history; needs verification.
-- **Thinking blocks from prior assistant turns are dropped** from injected
-  history. Anthropic's API requires valid signatures on persisted thinking
-  blocks. Each turn produces fresh thinking; this is not user-visible.
-- **Fast-mode mid-conversation toggle is expensive** (see caveats above).
+- **Provider-switch context loss.** If pi has prior conversation from a
+  different provider and you switch to pi-cas mid-session, only the
+  trailing user message reaches the SDK (the prior context is lost from
+  the SDK's view).
+- **Fast-mode mid-conversation toggle is expensive** (see Fast mode
+  caveats section above).
 
 ## Development
 
 ```bash
 npm install
-npm test            # 44 unit tests (persistence + relay + http-log + thinking)
+npm test            # 94 unit tests
 npm run typecheck   # tsc --noEmit
 ```
 
 For end-to-end validation against the real `claude` binary + Anthropic API
-(builds the project to a local dist dir and drives `streamViaSDK` through 6
-scenarios including tool turns, no-ops, and lifecycle teardown):
+(drives the full multi-segment stub-tool flow):
 
 ```bash
 rm -rf dist-probe && npx tsc --noEmit false --outDir dist-probe \
   --module ESNext --moduleResolution node --target ES2022 \
   --esModuleInterop --skipLibCheck src/*.ts
-ANTHROPIC_API_KEY=$(security find-generic-password -s "Claude Code" -w) \
-PI_CAS_BUILD=$PWD/dist-probe \
-  node probe-refactor-e2e.mjs
+export ANTHROPIC_API_KEY=$(security find-generic-password -s "Claude Code" -w)
+export PI_CAS_BUILD=$PWD/dist-probe
+export PI_CAS_STATE_PATH=/tmp/pi-cas-clean-state.json && rm -f $PI_CAS_STATE_PATH
+node probe-stub-tools-full.mjs    # full multi-segment e2e
+node probe-stub-tools.mjs         # one-tool SDK timing
+node probe-stub-tools-edge.mjs    # parallel tools + error result
 ```
+
+See `writeups/write_up.md` for the architecture overview and design
+decisions, `writeups/progress_log.md` for chronological development
+history, and `writeups/continuation_context.md` for handoff context.
 
 ## Acknowledgements
 

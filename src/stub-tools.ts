@@ -76,7 +76,6 @@ async function executeStub(
 ): Promise<{
   content: any[];
   details: unknown;
-  terminate?: boolean;
 }> {
   const entry = take(toolCallId);
   if (!entry) {

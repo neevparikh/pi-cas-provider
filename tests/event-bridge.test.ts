@@ -419,6 +419,45 @@ describe("event-bridge stream-aligned segmentation", () => {
     expect(bridge.getTurnError()).toMatch(/connection lost/i);
   });
 
+  it("closeStreamWithError preserves partial content (text already streamed) in the error event", async () => {
+    const bridge = createEventBridge(fakeModel);
+    const stream = createAssistantMessageEventStream();
+    bridge.attachStream(stream, fakeModel);
+
+    // Some text streamed before the SDK errored out.
+    bridge.handle(messageStart());
+    bridge.handle(cbStartText(0));
+    bridge.handle(cbDeltaText(0, "partial answer"));
+    // No content_block_stop, no message_stop — connection dropped here.
+
+    // Provider's error path: close with the captured turn error.
+    bridge.closeStreamWithError("network: connection reset");
+
+    const events: any[] = [];
+    for await (const ev of stream) events.push(ev);
+    const last = events[events.length - 1];
+    expect(last.type).toBe("error");
+    expect(last.error.errorMessage).toMatch(/connection reset/i);
+    // Partial content is preserved on the error message so pi can render
+    // whatever the user had already seen on screen.
+    expect(last.error.content.length).toBeGreaterThan(0);
+    expect((last.error.content[0] as any).text).toBe("partial answer");
+    expect(last.error.stopReason).toBe("error");
+  });
+
+  it("closeStreamWithError with no partial content emits an error event with empty content", async () => {
+    const bridge = createEventBridge(fakeModel);
+    const stream = createAssistantMessageEventStream();
+    bridge.attachStream(stream, fakeModel);
+    bridge.closeStreamWithError("auth failure");
+    const events: any[] = [];
+    for await (const ev of stream) events.push(ev);
+    const last = events[events.length - 1];
+    expect(last.type).toBe("error");
+    expect(last.error.errorMessage).toMatch(/auth failure/);
+    expect(last.error.content).toEqual([]);
+  });
+
   it("H2: resetTurn clears turnError state", () => {
     const bridge = createEventBridge(fakeModel);
     bridge.attachStream(createAssistantMessageEventStream(), fakeModel);

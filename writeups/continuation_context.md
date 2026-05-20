@@ -3,7 +3,9 @@
 ## Status
 
 **Stream-aligned segmentation + stub tools is the current architecture.**
-Commit `b42040e` or later.  Tests pass (77/77), both e2e probes pass.
+Commit `b42040e` ... HEAD.  Tests pass (94/94), both e2e probes pass.
+Follow-up review-feedback commits: `17fd2bd` (P1/P2), `192217c` (code
+review + test coverage).
 
 For the full design, choices, and history of what was tried/rejected, read
 `write_up.md`.  For the chronological development log read
@@ -88,3 +90,12 @@ node probe-stub-tools-edge.mjs
 
 Nothing in-progress.  Open paths are documented in `write_up.md` under
 "Open paths".
+
+Deferred hardening from the review pass:
+- **H4 (abort/signal unit tests)**: requires mocking the Agent SDK's
+  `query()`.  E2E probes don't cover in-flight abort.  Defer as a
+  separate task.
+- **Catch-all stub for unknown CC tool names** (Open path #4 in
+  write_up.md): would prevent `Tool <name> not found` crashes if a
+  future CC release surfaces a tool we haven't added to
+  `SUPPORTED_CC_TOOL_NAMES`.

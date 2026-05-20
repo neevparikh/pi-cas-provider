@@ -110,6 +110,21 @@ export interface EventBridge {
    * an error or just push an error event. */
   hasPartialContent(): boolean;
 
+  /** Return a copy of the in-progress segment's AssistantMessage (text,
+   * thinking, partial tool_use blocks that have been streamed so far).
+   * Used by the provider on the error path so partial content is
+   * preserved instead of being discarded.  After calling this, the
+   * provider should still close the stream (via `closeStreamWithError`
+   * or directly) and `resetTurn` to rearm. */
+  getPartialOutput(): AssistantMessage;
+
+  /** Push an `error` event carrying the bridge's accumulated partial
+   * content (if any) plus the supplied error message; ends the pi stream
+   * and resets per-segment state.  Use this on the error path when the
+   * SDK turn aborted mid-message; otherwise pi loses the partial text
+   * the user already started seeing on screen. */
+  closeStreamWithError(message: string): void;
+
   /** Get the pi-flavored stop reason for the current segment. */
   getSegmentStopReason(): PiStopReason;
 
@@ -562,6 +577,27 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
      * decide whether to surface partial content vs. push an empty error. */
     hasPartialContent(): boolean {
       return segmentStarted || output.content.length > 0 || sawAnyContentForSegment;
+    },
+    getPartialOutput(): AssistantMessage {
+      // Defensive clone: callers shouldn't mutate our internal state.
+      // Content blocks are shallow-cloned (the inner text/thinking strings
+      // are primitives, and ToolCall.arguments is best-effort already).
+      return {
+        ...output,
+        content: output.content.map((c) => ({ ...c })) as AssistantMessage["content"],
+        usage: { ...output.usage, cost: { ...output.usage.cost } },
+      };
+    },
+    closeStreamWithError(message: string): void {
+      output.stopReason = "error";
+      output.errorMessage = message;
+      if (stream) {
+        ensureStreamStarted();
+        stream.push({ type: "error", reason: "error", error: output } as any);
+        stream.end();
+      }
+      resetSegment();
+      stream = undefined;
     },
     handle,
     isSegmentReady,
