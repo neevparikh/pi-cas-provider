@@ -6,7 +6,12 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { loadState } from "./persistence.js";
+import { loadState, parsePermissionMode, type PermissionMode } from "./persistence.js";
+
+// Forward declaration: PiSession lives in provider.ts (it depends on the
+// SDK Query type).  We type-alias to `any` here to avoid a circular import.
+// The shape is enforced at the use site in provider.ts.
+export type PiSessionRef = any;
 
 export interface ProviderConfig {
   /** Whether fast mode should be enabled for the next request. */
@@ -25,11 +30,15 @@ export interface ProviderConfig {
    */
   baseUrlOverride?: string;
   /**
-   * Per-pi-session SDK session id, set the first time we get a request with a
-   * given pi sessionId. Lets the SDK's transcript stay consistent across turns,
-   * though we re-inject history each turn via sessionStore.load() regardless.
+   * Per-pi-session long-lived `PiSession` (see provider.ts).  One entry per
+   * active pi session id, populated on first `streamSimple`, torn down on
+   * `session_shutdown` / fork / compact.
+   *
+   * Typed loosely (`PiSessionRef = any`) to avoid a circular import between
+   * config.ts and provider.ts.  The concrete shape (long-lived `Query`,
+   * promptQueue, etc.) is defined and enforced inside provider.ts.
    */
-  sdkSessionIds: Map<string, string>;
+  sessions: Map<string, PiSessionRef>;
   /**
    * fast_mode_state reported by the API on the most recent request, if any.
    * This is ground truth: pi-cas may have *requested* fast mode, but the API
@@ -55,6 +64,33 @@ export interface ProviderConfig {
   lastOktaProvider?: string;
   /** Base URL from the most recent successful relay turn, for /cas-status. */
   lastOktaBaseUrl?: string;
+  /**
+   * SDK permission mode for the bundled `claude` subprocess. In the
+   * Option A architecture the SDK runs all tools natively, so this is
+   * the knob that decides what's allowed without prompting.
+   *
+   * Defaults to "bypassPermissions" — the simplest, most-tested mode
+   * for pi-cas. Configurable via `permissionMode` in pi-cas.json or
+   * the `PI_CAS_PERMISSION_MODE` env var (env wins). Mutable at
+   * runtime via `query.setPermissionMode()`; the long-lived subprocess
+   * picks up changes without restart.
+   */
+  permissionMode: PermissionMode;
+}
+
+/**
+ * Resolve the effective permissionMode default. Precedence:
+ *   1. PI_CAS_PERMISSION_MODE env var (per-launch override)
+ *   2. persisted permissionMode from pi-cas.json (sticky preference)
+ *   3. "bypassPermissions" — safe default for pi-cas: pi already controls
+ *      what code runs, the subprocess just needs permission to do its job.
+ */
+function resolveInitialPermissionMode(
+  persisted: PermissionMode | undefined,
+): PermissionMode {
+  const env = parsePermissionMode(process.env.PI_CAS_PERMISSION_MODE);
+  if (env) return env;
+  return persisted ?? "bypassPermissions";
 }
 
 /**
@@ -91,7 +127,8 @@ export function createDefaultConfig(): ProviderConfig {
       typeof persisted.okta?.provider === "string" && persisted.okta.provider.trim() !== ""
         ? persisted.okta.provider.trim()
         : undefined,
-    sdkSessionIds: new Map(),
+    permissionMode: resolveInitialPermissionMode(persisted.permissionMode),
+    sessions: new Map(),
   };
 }
 

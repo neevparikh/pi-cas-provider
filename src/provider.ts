@@ -2,16 +2,58 @@
  * Top-level provider wiring: registers the pi provider, slash commands, and
  * orchestrates the per-turn streamSimple call through the Agent SDK.
  *
- * Per-turn flow:
- *   1. Split pi history → transcript entries + new user-side content
- *   2. Stand up a one-shot SessionStore around those entries
- *   3. Build SDK options: systemPrompt (replace), allowed/disallowed tools,
- *      canUseTool deny, fastMode + effort, env overrides, sessionStore + resume
- *   4. Iterate query() — feed events into the bridge — push pi events
- *   5. Push final `done` (or `error`) to pi's stream
+ * # Architecture: long-lived query() per pi session
+ *
+ * Pi-cas used to spawn a fresh `query()` per turn and resume via the SDK's
+ * `sessionStore` / `resume` options.  That triggered the bundled `claude`
+ * binary's resume normalizer (`gG8 → iO6 → Xg5`) on every turn and required
+ * elaborate transcript reconstruction (see git history: `src/transcript.ts`,
+ * `src/session-store.ts`, both deleted in this refactor).
+ *
+ * The new architecture:
+ *
+ *   - ONE long-lived `query()` per pi session, lazily spawned on the first
+ *     `streamSimple` call.
+ *   - Prompt is an `AsyncIterable<SDKUserMessage>` that stays open for the
+ *     session's lifetime; each pi turn enqueues one user message.
+ *   - The SDK runs all tools natively (`permissionMode: "bypassPermissions"`
+ *     by default).  Pi-cas does NOT execute tools — it merely forwards
+ *     `tool_use`/`tool_result` stream events to pi for display.
+ *   - The SDK owns the on-disk JSONL transcript (under CLAUDE_CONFIG_DIR/
+ *     projects/<dirhash>/<sdk-session-id>.jsonl).  Pi-cas's history view is
+ *     authoritative for what pi displays; the SDK's view is authoritative
+ *     for what the model sees.
+ *
+ * # Per-turn flow
+ *
+ *   1. Resolve the per-session `PiSession` (lazy spawn on first turn).
+ *   2. Detect model / permissionMode changes from prior turn → invoke
+ *      `query.setModel()` / `query.setPermissionMode()` on the existing
+ *      subprocess.  No restart needed.
+ *   3. Extract the NEW user content from `context.messages` (everything
+ *      after `lastSentCount`), concat any user-side blocks, enqueue into
+ *      the AsyncIterable.
+ *   4. Consume SDK events until `result`, bridge them into pi's stream.
+ *   5. Push `done` with the final accumulated assistant message.
+ *
+ * # Lifecycle integration
+ *
+ *   - `session_start`: lazy spawn — defer until first streamSimple.
+ *   - `session_shutdown`: tear down the long-lived query (gen.return() +
+ *     interrupt()).
+ *   - `session_before_fork` / `session_before_compact`: tear down and clear
+ *     the pi-session → SDK-session mapping so the next streamSimple spawns
+ *     a fresh query (v1 limitation: model history is lost on fork; SDK's
+ *     forkSession + resumeSessionAt support is deferred to v2).
+ *
+ * # Concurrency invariant
+ *
+ *   Pi's agent loop guarantees at most one in-flight streamSimple per
+ *   session (see pi-coding-agent's agent-session.js:734).  We rely on
+ *   that: the per-session promptQueue / event consumer is not re-entrant.
  */
 
-import { query, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Options, type Query } from "@anthropic-ai/claude-agent-sdk";
 import {
   getModels,
   createAssistantMessageEventStream,
@@ -20,12 +62,9 @@ import {
   type SimpleStreamOptions,
   type Context,
 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { piToTranscript } from "./transcript.js";
-import { createPiSessionStore } from "./session-store.js";
 import { composeSystemPrompt } from "./system-prompt.js";
-import { ALLOWED_CC_TOOLS, DISALLOWED_CC_TOOLS } from "./tool-shim.js";
 import { mapEffort } from "./effort.js";
 import { buildThinkingConfig } from "./thinking.js";
 import { buildFastModeOptions, modelSupportsFastMode } from "./settings.js";
@@ -36,57 +75,82 @@ import {
   type ProviderConfig,
   createDefaultConfig,
   PROVIDER_ID,
-  PROJECT_KEY,
 } from "./config.js";
-import { loadState, saveState, statePath } from "./persistence.js";
+import {
+  loadState,
+  saveState,
+  statePath,
+  parsePermissionMode,
+  getSessionMapping,
+  setSessionMapping,
+  clearSessionMapping,
+  type PermissionMode,
+} from "./persistence.js";
 import { requestRelay, type RelayConfig } from "./relay.js";
 import { startLogProxy, type LogProxyHandle } from "./http-log-proxy.js";
 
-/**
- * Continuation hint yielded via promptGen when pi-cas has no genuinely-new
- * user content for this turn (the common tool-result-only continuation case).
- *
- * Background: after the synth-asst-marker fix in transcript.ts, every
- * non-empty historic transcript ends with a synthetic assistant message
- * ("No response requested.").  Yielding empty content via promptGen makes
- * the bundled `claude` binary substitute its `(no content)` placeholder,
- * and the model then treats the conversation as "finished" — replying with
- * a generic acknowledgement like "I'm here if you need anything else" —
- * rather than responding to the tool_result earlier in the buffer.
- *
- * A substantive continuation hint nudges the model to actually respond to
- * the recent tool_result.  Empirically verified during design probes: with
- * this hint, the model produces the expected contextual response ("The
- * command printed: ...") rather than a generic acknowledgement.
- *
- * The hint is visible only to the model.  Pi-cas's promptGen output is NOT
- * persisted to pi's history, so users never see it.
- */
-const CONTINUATION_HINT = "Continue based on the tool result above.";
+const DEBUG = process.env.PI_CAS_DEBUG === "1";
 
-/** Top-level entry called by index.ts. */
+/* ----------------------------- per-session state ----------------------------- */
+
+/**
+ * State for one long-lived SDK query, scoped to a single pi session.
+ *
+ * Lifetime: created lazily on the first `streamSimple` for a given pi
+ * session id, destroyed on `session_shutdown` or fork/compact.  Held in
+ * `ProviderConfig.sessions`.
+ */
+interface PiSession {
+  piSessionId: string;
+  /** The SDK's session UUID, captured from the first `system.init` event. */
+  sdkSessionId: string | undefined;
+  /** Long-lived SDK query handle. */
+  query: Query;
+  /**
+   * Persistent iterator over the SDK query's events.  CRITICAL: we obtain
+   * this ONCE at session creation and reuse it across every turn's
+   * streamSimple call.  Using `for await (const msg of query)` and
+   * `break`ing on `result` would call `iter.return()` and CLOSE the
+   * generator, preventing all subsequent turns from receiving events.
+   * This was confirmed empirically against the SDK's iterator semantics.
+   */
+  iter: AsyncIterator<any>;
+  /** FIFO queue of pending user messages to yield into the AsyncIterable. */
+  promptQueue: Array<{ content: any; resolved: () => void; failed: (e: any) => void }>;
+  /** Resolver for the awaitable inside the prompt-gen loop. */
+  genWaker: (() => void) | null;
+  /** Signals the gen to return (clean shutdown). */
+  ended: boolean;
+  /** A `result` arrived but the consumer hasn't read it yet — set/cleared per-turn. */
+  inFlight: boolean;
+  cwd: string;
+  /** Last-known model id for change detection across turns. */
+  model: string;
+  /** Last-known permissionMode for change detection across turns. */
+  permissionMode: PermissionMode;
+  /**
+   * How many of pi's messages we've already consumed.  Each `streamSimple`
+   * call processes `context.messages.slice(lastSentCount)` to extract the
+   * new user input.  Reset to 0 on fork/compact (mapping cleared → next
+   * streamSimple spawns fresh and starts counting over).
+   */
+  lastSentCount: number;
+}
+
+/* ----------------------------- registration ----------------------------- */
+
 export function registerProvider(pi: ExtensionAPI): void {
   // Module-level config; slash commands mutate this.
-  // We construct config before printing the auth banner so okta mode (read
-  // from pi-cas.json) can short-circuit the local-auth classification, which
-  // is misleading when the subprocess is going through a relay anyway.
   const config: ProviderConfig = createDefaultConfig();
 
-  // Optional HTTP log proxy. Enabled by PI_CAS_HTTP_LOG=/path/to/file.jsonl.
-  // When set, the proxy spins up at startup and pi-cas points the subprocess
-  // at it; the proxy logs every Anthropic request/response (with sensitive
-  // headers redacted) and forwards to the *real* upstream. The upstream is
-  // updated per-turn so it follows the okta relay's URL when okta is on.
-  // We start asynchronously and let streamViaSDK await the promise on the
-  // first turn, so a slow startup doesn't block extension registration.
+  // Optional HTTP log proxy.  Same lifecycle as before: lazy-start, point the
+  // subprocess at it via env, forward to whichever upstream we end up using.
   let logProxyPromise: Promise<LogProxyHandle> | undefined;
   const httpLogPath = process.env.PI_CAS_HTTP_LOG?.trim();
   if (httpLogPath) {
-    const logResponseBody = process.env.PI_CAS_HTTP_LOG_RESPONSES === "1" ||
-                            process.env.PI_CAS_HTTP_LOG_RESPONSES === "true";
-    // Initial upstream is a placeholder; pi-cas overrides it before each turn
-    // via setUpstreamBaseUrl(). We pick api.anthropic.com as a sane default in
-    // case someone hits the proxy before the first turn.
+    const logResponseBody =
+      process.env.PI_CAS_HTTP_LOG_RESPONSES === "1" ||
+      process.env.PI_CAS_HTTP_LOG_RESPONSES === "true";
     logProxyPromise = startLogProxy({
       initialUpstreamBaseUrl: "https://api.anthropic.com",
       logFilePath: httpLogPath,
@@ -121,6 +185,7 @@ export function registerProvider(pi: ExtensionAPI): void {
         : `persisted preference (${statePath()})`;
     console.error(`[pi-cas] fast mode enabled at startup — source: ${source}`);
   }
+  console.error(`[pi-cas] permissionMode=${config.permissionMode}`);
   if (config.configDirOverride) {
     console.error(`[pi-cas] CLAUDE_CONFIG_DIR override: ${config.configDirOverride}`);
   }
@@ -138,18 +203,14 @@ export function registerProvider(pi: ExtensionAPI): void {
     );
   }
 
-  // Badge: emits `pi-cas:fast-mode` events + owns the `pi-cas-fast` status
-  // entry in the footer. Both surfaces are no-ops for anyone who doesn't
-  // subscribe / doesn't render the footer, so this is purely additive.
   const badge = new FastModeBadge(pi);
-  // Broadcast initial intent so subscribers can render before the first turn.
   badge.update({ intent: config.fastMode });
 
-  // Slash commands
+  // Lifecycle: tear down on shutdown / fork / compact.  See module docstring.
+  registerLifecycleHooks(pi, config);
+
   registerSlashCommands(pi, config, badge);
 
-  // Provider registration: take pi's Anthropic model catalog and present it
-  // under our provider id with our custom streamSimple.
   const models = getModels("anthropic").map((m) => ({
     id: m.id,
     name: m.name,
@@ -160,24 +221,92 @@ export function registerProvider(pi: ExtensionAPI): void {
     maxTokens: m.maxTokens,
   }));
 
-  // Pi treats `apiKey` as an env-var name first, falling back to a literal.
-  // Our real auth is whatever the `claude` subprocess uses (API key or Console
-  // OAuth), so we don't need a key here — but pi shows "Not logged in" in the
-  // footer if the value doesn't resolve. Set the env var to a non-empty
-  // sentinel so pi's auth-presence check passes. The value is never used.
+  // Pi requires *some* env-resolvable apiKey for footer auth-presence.  Our
+  // real auth is whatever the `claude` subprocess uses; this is a sentinel.
   if (!process.env.PI_CAS_UNUSED) {
     process.env.PI_CAS_UNUSED = "managed-by-claude-subprocess";
   }
 
   pi.registerProvider(PROVIDER_ID, {
     name: "Claude (via Agent SDK)",
-    baseUrl: PROVIDER_ID,         // unused, but pi requires it
-    apiKey: "PI_CAS_UNUSED",      // satisfies pi's auth-presence check only
+    baseUrl: PROVIDER_ID,
+    apiKey: "PI_CAS_UNUSED",
     api: PROVIDER_ID as any,
     models,
     streamSimple: (model, context, options) =>
       streamViaSDK(pi, model, context as Context, options, config, badge, logProxyPromise),
   });
+}
+
+/* ----------------------------- lifecycle ----------------------------- */
+
+function registerLifecycleHooks(pi: ExtensionAPI, config: ProviderConfig): void {
+  pi.on("session_shutdown", async (event) => {
+    if (DEBUG) console.error(`[pi-cas/debug] session_shutdown reason=${event.reason}`);
+    for (const [piId, session] of config.sessions) {
+      await teardownSession(session, `session_shutdown(${event.reason})`);
+      // On a hard shutdown ("quit"), keep the mapping so the next pi launch
+      // can resume.  On reload/new/resume/fork, clear it — those reasons
+      // mean the next pi-cas instance for this id should NOT pick up the
+      // old SDK session.
+      if (event.reason !== "quit") {
+        clearSessionMapping(piId);
+      }
+    }
+    config.sessions.clear();
+  });
+
+  pi.on("session_before_fork", async (event) => {
+    if (DEBUG) console.error(`[pi-cas/debug] session_before_fork entry=${event.entryId} position=${event.position}`);
+    // V1: tear down + clear mapping.  Next streamSimple after the fork will
+    // spawn a fresh query with no SDK-side history (i.e. the model loses
+    // context).  This is the documented v1 limitation; v2 should use the
+    // SDK's forkSession + resumeSessionAt to preserve history.
+    for (const [piId, session] of config.sessions) {
+      await teardownSession(session, "session_before_fork");
+      clearSessionMapping(piId);
+    }
+    config.sessions.clear();
+    // Don't cancel the fork — return without a result/decision means "proceed".
+  });
+
+  pi.on("session_before_compact", async () => {
+    if (DEBUG) console.error(`[pi-cas/debug] session_before_compact`);
+    // Same handling as fork: tear down the SDK session.  Pi will replace
+    // its history with the compaction summary and the next streamSimple
+    // will spawn fresh.
+    for (const [piId, session] of config.sessions) {
+      await teardownSession(session, "session_before_compact");
+      clearSessionMapping(piId);
+    }
+    config.sessions.clear();
+  });
+}
+
+/**
+ * Cleanly tear down a long-lived SDK query.  Best-effort: never throws.
+ */
+async function teardownSession(session: PiSession, reason: string): Promise<void> {
+  if (session.ended) return;
+  session.ended = true;
+  if (DEBUG) console.error(`[pi-cas/debug] teardown ${session.piSessionId} (${reason})`);
+
+  // Wake the gen so it exits its await.
+  if (session.genWaker) {
+    const w = session.genWaker;
+    session.genWaker = null;
+    w();
+  }
+  // Reject any queued prompts so callers don't hang.
+  for (const item of session.promptQueue.splice(0)) {
+    item.failed(new Error(`pi-cas session torn down: ${reason}`));
+  }
+  // Interrupt to unblock any in-flight model turn quickly.
+  try {
+    await session.query.interrupt();
+  } catch {
+    /* already done or never started */
+  }
 }
 
 /* ----------------------------- streamSimple ----------------------------- */
@@ -193,286 +322,187 @@ function streamViaSDK(
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
 
-  // The async pump — fire-and-forget; the returned stream surfaces events to pi.
   void (async () => {
-    const DEBUG = process.env.PI_CAS_DEBUG === "1";
-    if (DEBUG) {
-      console.error(`[pi-cas/debug] streamViaSDK: model=${model.id}, ${context.messages.length} msg(s), systemPrompt=${(context.systemPrompt ?? "").length} chars`);
-    }
+    const piSessionId = (options as any)?.sessionId ?? "default";
     const cwd = (options as any)?.cwd ?? process.cwd();
 
-    // 1. Map pi's per-session id → a stable SDK session id we use across turns.
-    const piSessionId = (options as any)?.sessionId ?? "default";
-    let sdkSessionId = config.sdkSessionIds.get(piSessionId);
-    if (!sdkSessionId) {
-      sdkSessionId = crypto.randomUUID();
-      config.sdkSessionIds.set(piSessionId, sdkSessionId);
-    }
-
-    // 2. Build transcript + new prompt content.
-    const { transcript, newUserContent, hasPairedToolResults } = piToTranscript(
-      context.messages as any[],
-      { cwd, sessionId: sdkSessionId },
-    );
     if (DEBUG) {
-      const newCT = newUserContent.map((b: any) => b.type).join(",");
-      console.error(`[pi-cas/debug] transcript=${transcript.length} entries, newUserContent=[${newCT}], hasPairedToolResults=${hasPairedToolResults}`);
-    }
-
-    // Empty newUserContent is an expected case after the transcript.ts fix:
-    // it means pi just ran a tool and the matching tool_result was paired
-    // into the historic transcript, leaving no genuinely-new user content
-    // for this turn.  promptGen yields CONTINUATION_HINT in that case
-    // (see the const at module scope for rationale).  We log only in DEBUG
-    // mode — this is no longer the bug-signal it once was.
-    if (DEBUG && newUserContent.length === 0) {
       console.error(
-        `[pi-cas/debug] newUserContent empty (tool-result-only continuation — ` +
-          `historic transcript has the paired tool_result folded in, promptGen ` +
-          `will yield a benign continuation marker)`,
+        `[pi-cas/debug] streamSimple: pi=${piSessionId} model=${model.id} ` +
+          `msgs=${context.messages.length} sys=${(context.systemPrompt ?? "").length}b`,
       );
     }
 
-    // 3. Resolve fast-mode/effort fragments.
-    const fastModeRequested = config.fastMode && modelSupportsFastMode(model.id);
-    const fastFrag = buildFastModeOptions(fastModeRequested, model.id);
-
-    // 3b. Resolve okta-routed relay endpoint (if enabled). We do this BEFORE
-    // building env so we can fail fast with a clear error if the responder
-    // is missing or its refresh failed — better than spawning the subprocess
-    // and getting a confusing 401 downstream.
-    let relay: RelayConfig | undefined;
-    if (config.oktaEnabled) {
-      try {
-        relay = await requestRelay(pi, {
-          preferredProvider: config.oktaProvider,
-          timeoutMs: 8000,
-        });
-        config.lastOktaProvider = relay.provider;
-        config.lastOktaBaseUrl = relay.baseUrl;
-        if (DEBUG) {
-          console.error(
-            `[pi-cas/debug] okta relay resolved via "${relay.provider}" → ${relay.baseUrl}` +
-              ` (token len=${relay.accessToken.length})`,
-          );
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        const out: any = {
-          role: "assistant",
-          content: [],
-          api: model.api,
-          provider: model.provider,
-          model: model.id,
-          usage: {
-            input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-          },
-          stopReason: "error",
-          errorMessage:
-            `pi-cas okta mode is on but the relay request failed: ${msg}. ` +
-            "Run `/cas-okta off` to disable, or fix the responder " +
-            "(`/login <provider>` outside pi).",
-          timestamp: Date.now(),
-        };
-        stream.push({ type: "error", reason: "error", error: out } as any);
-        stream.end();
-        return;
-      }
-    }
-
-    // 4. Build the subprocess env.
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (typeof v === "string") env[k] = v;
-    }
-    if (config.configDirOverride) env.CLAUDE_CONFIG_DIR = config.configDirOverride;
-    // Okta relay wins over PI_CAS_API_KEY / PI_CAS_BASE_URL on purpose: if the
-    // user explicitly enabled okta mode, that's the auth path they want, and
-    // mixing a stale env-var key in would confuse the claude binary.
-    if (relay) {
-      env.ANTHROPIC_API_KEY = relay.accessToken;
-      env.ANTHROPIC_BASE_URL = relay.baseUrl;
-      // The bundled claude binary picks up Bearer auth from these and would
-      // send both `Authorization: Bearer ...` and `x-api-key: ...`. The relay
-      // (e.g. middleman) only accepts x-api-key; sending Authorization
-      // alongside causes a 401. Strip them so x-api-key=relay-token is the
-      // sole credential.
-      delete env.ANTHROPIC_AUTH_TOKEN;
-      delete env.CLAUDE_CODE_OAUTH_TOKEN;
-    } else {
-      if (config.apiKeyOverride) env.ANTHROPIC_API_KEY = config.apiKeyOverride;
-      if (config.baseUrlOverride) env.ANTHROPIC_BASE_URL = config.baseUrlOverride;
-    }
-    if (fastFrag.env) Object.assign(env, fastFrag.env);
-
-    // 4b. If the HTTP log proxy is enabled, redirect the subprocess through
-    // it. The proxy snoops on the wire and forwards to whichever upstream
-    // we just decided on. We MUST set ANTHROPIC_BASE_URL last (after fastFrag
-    // and the relay/override block) so the proxy URL isn't clobbered.
-    if (logProxyPromise) {
-      try {
-        const proxy = await logProxyPromise;
-        const trueUpstream =
-          env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com";
-        proxy.setUpstreamBaseUrl(trueUpstream);
-        env.ANTHROPIC_BASE_URL = proxy.getBaseUrl();
-        if (DEBUG) {
-          console.error(
-            `[pi-cas/debug] HTTP log proxy active: ${proxy.getBaseUrl()} → ${trueUpstream}`,
-          );
-        }
-      } catch (err) {
-        // Already logged at startup; just continue without the proxy.
-        if (DEBUG) console.error(`[pi-cas/debug] log proxy unavailable, skipping`, err);
-      }
-    }
-
-    // 5. Hook up abort.
-    const abortController = new AbortController();
-    if (options?.signal) {
-      if (options.signal.aborted) abortController.abort();
-      else options.signal.addEventListener("abort", () => abortController.abort(), { once: true });
-    }
-
-    // 6. Compose final system prompt (pi's + shim notes).
-    const systemPrompt = composeSystemPrompt(context.systemPrompt);
-
-    // 7. Only attach sessionStore + resume when we have history to inject.
-    // On the first turn the transcript is empty and `resume`-ing into nothing
-    // confuses the SDK (returns error_during_execution).
-    const hasHistory = transcript.length > 0;
-    const sessionOpts: Partial<Options> = hasHistory
-      ? {
-          resume: sdkSessionId,
-          sessionStore: createPiSessionStore({
-            sessionId: sdkSessionId,
-            projectKey: PROJECT_KEY,
-            entries: transcript as any,
-          }) as any,
-        }
-      : {};
-
-    const sdkOpts: Options = {
-      model: model.id,
-      systemPrompt,
-      settingSources: [],          // do not load Claude Code's own settings
-      allowedTools: [...ALLOWED_CC_TOOLS],
-      disallowedTools: [...DISALLOWED_CC_TOOLS],
-      canUseTool: async () => ({
-        behavior: "deny",
-        interrupt: true,
-        message: "pi executes tools",
-      }),
-      ...sessionOpts,
-      includePartialMessages: true,
-      abortController,
-      cwd,
-      env,
-      ...fastFrag.extraArgs ? { extraArgs: fastFrag.extraArgs } : {},
-      effort: mapEffort(options?.reasoning),
-      // Without this the SDK never passes `--thinking-display` to the bundled
-      // `claude` subprocess, so the API never emits summarized thinking blocks
-      // even on Opus 4.6/4.7. The CLI's `showThinkingSummaries` settings.json
-      // fallback can't rescue us either: `settingSources: []` above tells the
-      // CLI not to load user/project settings, and our `extraArgs.settings`
-      // blob (from buildFastModeOptions) doesn't include it.
-      thinking: buildThinkingConfig(model, options?.reasoning, options?.thinkingBudgets),
-    };
-
-    const bridge = createEventBridge(stream, model);
-
-    // 8. Prompt generator — yields the new user turn's content.
-    //
-    // When `newUserContent` is empty, we yield CONTINUATION_HINT only when
-    // `hasPairedToolResults` is also true (i.e. the historic transcript
-    // really does end with a tool_result that the model should address).
-    // For other empty-content cases (e.g. pi sent a user message whose
-    // content reduced to nothing under our block translators) we fall
-    // back to the bundled binary's default `(no content)` placeholder —
-    // the hint about "the tool result above" would be misleading.
-    //
-    // See CONTINUATION_HINT (module scope) for the full rationale.
-    async function* promptGen() {
-      const useHint = newUserContent.length === 0 && hasPairedToolResults;
-      yield {
-        type: "user" as const,
-        message: {
-          role: "user" as const,
-          content: useHint
-            ? CONTINUATION_HINT
-            : newUserContent.length === 0
-              ? ""
-              : (newUserContent as any),
-        },
-        parent_tool_use_id: null,
-      };
-    }
-
+    // 1. Resolve or spawn the per-session long-lived query.
+    let session: PiSession;
     try {
-      if (DEBUG) console.error(`[pi-cas/debug] calling query() with sessionId=${sdkSessionId}, transcript=${transcript.length} entries, newUserContent=${newUserContent.length} blocks, fastMode=${fastModeRequested}`);
-      let toolUseSeen = false;
-      for await (const msg of query({ prompt: promptGen(), options: sdkOpts }) as any) {
-        if (DEBUG && msg.type === "result" && msg.is_error) {
-          console.error(`[pi-cas/debug] error result:`,
-            JSON.stringify({ subtype: msg.subtype, result: msg.result }, null, 2));
-        }
-        bridge.handle(msg);
+      session = await ensureSession(
+        pi,
+        piSessionId,
+        cwd,
+        model,
+        context,
+        options,
+        config,
+        logProxyPromise,
+      );
+    } catch (err: any) {
+      pushError(stream, model, err?.message ?? String(err));
+      return;
+    }
 
-        if (msg.type === "result") break;
-
-        // Break-early on completed tool_use. After canUseTool denies a tool,
-        // the SDK runs a *second* internal turn that emits post-denial text;
-        // that text contaminates pi's view of the assistant turn. Stopping at
-        // message_stop with a tool_use already in content keeps the turn clean.
-        const sseEvent = msg.type === "stream_event" ? (msg.event ?? msg) : null;
-        const isMessageStop = sseEvent?.type === "message_stop";
-        const hasToolUse = bridge.getOutput().content.some((c) => c.type === "toolCall");
-        if (isMessageStop && hasToolUse && !toolUseSeen) {
-          toolUseSeen = true;
-          if (DEBUG) console.error(`[pi-cas/debug] break-early on tool_use turn`);
-          break;
+    // 2. Detect mid-session model / permissionMode changes and apply.
+    try {
+      if (session.model !== model.id) {
+        if (DEBUG) console.error(`[pi-cas/debug] setModel: ${session.model} → ${model.id}`);
+        await session.query.setModel(model.id);
+        session.model = model.id;
+      }
+      if (session.permissionMode !== config.permissionMode) {
+        if (DEBUG) {
+          console.error(
+            `[pi-cas/debug] setPermissionMode: ${session.permissionMode} → ${config.permissionMode}`,
+          );
         }
+        await session.query.setPermissionMode(config.permissionMode);
+        session.permissionMode = config.permissionMode;
       }
     } catch (err: any) {
-      if (DEBUG) console.error(`[pi-cas/debug] query() threw:`, err);
-      const output = bridge.getOutput();
-      output.stopReason = abortController.signal.aborted ? "aborted" : "error";
-      output.errorMessage = err?.message ?? String(err);
-      stream.push({ type: "error", reason: output.stopReason, error: output } as any);
+      // Control-plane errors aren't fatal; log and continue with stale settings.
+      console.error(
+        `[pi-cas] warning: control API call failed (${err?.message ?? err}); continuing with prior settings`,
+      );
+    }
+
+    // 3. Extract the new user-side content from pi's messages.
+    const newUserBlocks = extractNewUserContent(context.messages, session.lastSentCount);
+    session.lastSentCount = context.messages.length;
+
+    if (DEBUG) {
+      console.error(
+        `[pi-cas/debug] new user blocks: ${newUserBlocks.length} (types=${newUserBlocks
+          .map((b: any) => b.type)
+          .join(",")})`,
+      );
+    }
+
+    // No new user content → either pi sent us a no-op or the SDK already
+    // handled this internally.  Push an empty `done` to keep pi happy.
+    if (newUserBlocks.length === 0) {
+      const empty: any = makeEmptyAssistantMessage(model);
+      stream.push({ type: "done", reason: "stop", message: empty } as any);
       stream.end();
       return;
     }
 
-    // Capture ground-truth fast-mode state for /cas-status to surface.
+    // 4. Hook up abort.
+    const abortListener = () => {
+      session.query.interrupt().catch(() => {});
+    };
+    if (options?.signal) {
+      if (options.signal.aborted) {
+        abortListener();
+      } else {
+        options.signal.addEventListener("abort", abortListener, { once: true });
+      }
+    }
+
+    // 5. Enqueue the new user message into the long-lived gen.
+    const enqueuePromise = new Promise<void>((resolve, reject) => {
+      session.promptQueue.push({
+        content: newUserBlocks,
+        resolved: resolve,
+        failed: reject,
+      });
+      if (session.genWaker) {
+        const w = session.genWaker;
+        session.genWaker = null;
+        w();
+      }
+    });
+
+    // 6. Consume SDK events for this turn.
+    const bridge = createEventBridge(stream, model);
+    session.inFlight = true;
+    try {
+      // Wait until the gen has actually yielded our message before we start
+      // counting events for "this turn" — otherwise a delayed prior turn
+      // could leak events into ours.  enqueuePromise resolves inside the
+      // gen body after `yield` returns control.
+      await enqueuePromise;
+
+      // The query's event consumer is shared across all turns.  We pluck
+      // events off the persistent iterator until we see a `result`.
+      //
+      // NOTE: we MUST NOT use `for await ... break`, which calls
+      // `iter.return()` and closes the generator.  We use the iterator
+      // directly so subsequent turns keep reading from the same stream.
+      while (true) {
+        const next = await session.iter.next();
+        if (next.done) {
+          if (DEBUG) console.error(`[pi-cas/debug] iter exhausted unexpectedly`);
+          break;
+        }
+        const msg = next.value;
+        if (DEBUG && msg.type === "result" && msg.is_error) {
+          console.error(
+            `[pi-cas/debug] error result:`,
+            JSON.stringify({ subtype: msg.subtype, result: msg.result }, null, 2),
+          );
+        }
+        // Capture sdk_session_id from the very first init event.
+        if (
+          !session.sdkSessionId &&
+          msg.type === "system" &&
+          msg.subtype === "init" &&
+          msg.session_id
+        ) {
+          session.sdkSessionId = msg.session_id;
+          setSessionMapping(session.piSessionId, msg.session_id);
+        }
+        bridge.handle(msg);
+        if (msg.type === "result") {
+          break;
+        }
+      }
+    } catch (err: any) {
+      if (DEBUG) console.error(`[pi-cas/debug] consume loop threw:`, err);
+      pushError(stream, model, err?.message ?? String(err), bridge);
+      session.inFlight = false;
+      return;
+    } finally {
+      if (options?.signal) {
+        options.signal.removeEventListener("abort", abortListener);
+      }
+    }
+    session.inFlight = false;
+
+    // 7. Fast-mode state + badge update.
     const fms = bridge.getFastModeState();
     config.lastModel = model.id;
     if (fms) config.lastFastModeState = fms;
     if (DEBUG && fms) {
-      console.error(`[pi-cas/debug] fast_mode_state=${fms}, cost=$${bridge.getCost()?.toFixed(4) ?? "?"}`);
+      console.error(
+        `[pi-cas/debug] fast_mode_state=${fms}, cost=$${bridge.getCost()?.toFixed(4) ?? "?"}`,
+      );
     }
-    // Re-broadcast badge state with the just-confirmed `actual`. Dims the
-    // footer glyph (and any subscribed extension's UI) if the API refused to
-    // engage fast mode despite our request.
     badge.update({
       intent: config.fastMode,
       actual: config.lastFastModeState,
       model: config.lastModel,
     });
-    // One-shot warning when we *requested* fast mode and the API authoritatively
-    // refused it. Only fires if fms is reported (the API echoed it back) — we
-    // don't speculate based on local config.
+    const fastModeRequested = config.fastMode && modelSupportsFastMode(model.id);
     if (fastModeRequested && fms === "off" && !config.fastModeWarned) {
       config.fastModeWarned = true;
       console.warn(
         "[pi-cas] fast mode was requested but the API returned fast_mode_state=off. " +
-        "Either your org lacks the extra-usage entitlement, or the selected model " +
-        `(${model.id}) doesn't support fast mode (Opus 4.6/4.7 only). See ` +
-        "https://code.claude.com/docs/en/fast-mode#requirements",
+          "Either your org lacks the extra-usage entitlement, or the selected model " +
+          `(${model.id}) doesn't support fast mode (Opus 4.6/4.7 only). See ` +
+          "https://code.claude.com/docs/en/fast-mode#requirements",
       );
     }
 
-    // Push final done.
+    // 8. Push final done.
     const output = bridge.getOutput();
     const hasToolCalls = output.content.some((c) => c.type === "toolCall");
     const reason: "stop" | "length" | "toolUse" =
@@ -489,29 +519,329 @@ function streamViaSDK(
   return stream;
 }
 
+/* ----------------------------- session bootstrap ----------------------------- */
+
+/**
+ * Resolve the long-lived `PiSession` for a given pi session id.  Lazy-spawns
+ * the SDK query on first call.
+ */
+async function ensureSession(
+  pi: ExtensionAPI,
+  piSessionId: string,
+  cwd: string,
+  model: Model<any>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  config: ProviderConfig,
+  logProxyPromise: Promise<LogProxyHandle> | undefined,
+): Promise<PiSession> {
+  const existing = config.sessions.get(piSessionId);
+  if (existing && !existing.ended) {
+    // Sanity: if pi somehow changed cwd mid-session (shouldn't happen — pi
+    // restarts the agent on cwd change), tear down and respawn.
+    if (existing.cwd !== cwd) {
+      if (DEBUG) console.error(`[pi-cas/debug] cwd changed (${existing.cwd} → ${cwd}); respawning`);
+      await teardownSession(existing, "cwd-change");
+      clearSessionMapping(piSessionId);
+      config.sessions.delete(piSessionId);
+    } else {
+      return existing;
+    }
+  }
+
+  // Spawn fresh.  If we have a persisted SDK session id, resume into it so
+  // the SDK can replay its own (clean, properly-paired) JSONL.
+  const resumeId = getSessionMapping(piSessionId);
+  if (DEBUG) {
+    console.error(
+      `[pi-cas/debug] spawning query: pi=${piSessionId} cwd=${cwd} resume=${resumeId ?? "(none)"}`,
+    );
+  }
+
+  // Resolve okta relay BEFORE spawning so we can fail fast.
+  let relay: RelayConfig | undefined;
+  if (config.oktaEnabled) {
+    relay = await requestRelay(pi, {
+      preferredProvider: config.oktaProvider,
+      timeoutMs: 8000,
+    });
+    config.lastOktaProvider = relay.provider;
+    config.lastOktaBaseUrl = relay.baseUrl;
+    if (DEBUG) {
+      console.error(
+        `[pi-cas/debug] okta relay resolved: ${relay.provider} → ${relay.baseUrl}`,
+      );
+    }
+  }
+
+  // Build the env for the subprocess.
+  const env = buildSubprocessEnv(config, model, relay);
+
+  // HTTP log proxy: point the subprocess at it.
+  if (logProxyPromise) {
+    try {
+      const proxy = await logProxyPromise;
+      const trueUpstream = env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com";
+      proxy.setUpstreamBaseUrl(trueUpstream);
+      env.ANTHROPIC_BASE_URL = proxy.getBaseUrl();
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] log proxy active: ${proxy.getBaseUrl()} → ${trueUpstream}`,
+        );
+      }
+    } catch (err) {
+      if (DEBUG) console.error(`[pi-cas/debug] log proxy unavailable:`, err);
+    }
+  }
+
+  const systemPrompt = composeSystemPrompt(context.systemPrompt);
+  const fastModeRequested = config.fastMode && modelSupportsFastMode(model.id);
+  const fastFrag = buildFastModeOptions(fastModeRequested, model.id);
+
+  // Build the prompt AsyncIterable.  It pulls items off promptQueue and
+  // yields them; resolves each item's promise as a "this message is now in
+  // the SDK's hands" signal so streamSimple knows when to start consuming
+  // events for the corresponding turn.
+  //
+  // Note: SDK's streaming-input mode only accepts user messages; assistant
+  // history goes through `resume`.
+  const promptQueue: PiSession["promptQueue"] = [];
+  let genWaker: (() => void) | null = null;
+  let ended = false;
+
+  const sessionRef: { current?: PiSession } = {};
+
+  async function* promptGen() {
+    while (true) {
+      if (ended) return;
+      if (promptQueue.length === 0) {
+        await new Promise<void>((resolve) => {
+          genWaker = resolve;
+          if (sessionRef.current) sessionRef.current.genWaker = resolve;
+        });
+        if (ended) return;
+        continue;
+      }
+      const item = promptQueue.shift()!;
+      try {
+        yield {
+          type: "user" as const,
+          message: { role: "user" as const, content: item.content },
+          parent_tool_use_id: null,
+        };
+        item.resolved();
+      } catch (err) {
+        item.failed(err);
+        throw err;
+      }
+    }
+  }
+
+  const sdkOpts: Options = {
+    model: model.id,
+    systemPrompt,
+    settingSources: [],
+    permissionMode: config.permissionMode,
+    includePartialMessages: true,
+    cwd,
+    env,
+    ...(resumeId ? { resume: resumeId } : {}),
+    ...(fastFrag.extraArgs ? { extraArgs: fastFrag.extraArgs } : {}),
+    effort: mapEffort(options?.reasoning),
+    thinking: buildThinkingConfig(model, options?.reasoning, options?.thinkingBudgets),
+  };
+
+  const q = query({ prompt: promptGen(), options: sdkOpts });
+
+  // Capture the iterator once.  See PiSession.iter docstring for why we
+  // can't use `for await`-with-break across multiple turns.
+  const iter = (q as any)[Symbol.asyncIterator]() as AsyncIterator<any>;
+
+  const session: PiSession = {
+    piSessionId,
+    sdkSessionId: undefined,
+    query: q,
+    iter,
+    promptQueue,
+    genWaker: null,
+    ended: false,
+    inFlight: false,
+    cwd,
+    model: model.id,
+    permissionMode: config.permissionMode,
+    // We're about to enqueue the message that corresponds to context.messages
+    // up to and including the most recent user-side block.  Mark "everything
+    // before this call" as already consumed; the calling streamSimple will
+    // update lastSentCount = context.messages.length after extracting.
+    lastSentCount: 0,
+  };
+  sessionRef.current = session;
+  // Splice the local closure waker onto the session so teardown can find it.
+  // (We also keep `genWaker` updated inside promptGen's await above.)
+  Object.defineProperty(session, "genWaker", {
+    get: () => genWaker,
+    set: (v: any) => { genWaker = v; },
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(session, "ended", {
+    get: () => ended,
+    set: (v: any) => { ended = v; },
+    enumerable: true,
+    configurable: true,
+  });
+  config.sessions.set(piSessionId, session);
+
+  // Drain the init event eagerly so we capture sdk_session_id before the
+  // first turn's main event loop starts — and so any spawn-time failure
+  // surfaces here instead of in the streamSimple consume loop.  We DON'T
+  // consume past `system.init` because there's no work for the SDK yet
+  // (no prompt has been yielded).
+  //
+  // Subtle: pi's first streamSimple will share the same `for await` iterator
+  // across the session.  But the SDK's `query()` returns an async iterable
+  // that's iterable-once; we can't drain init here and re-iterate later.
+  //
+  // Solution: don't drain.  Capture sdk_session_id when the streamSimple
+  // consume loop sees it.
+  return session;
+}
+
+/**
+ * Build the env vars for the subprocess.  Mirrors the previous provider's
+ * env logic: configDir, okta relay creds, fastMode, etc.
+ */
+function buildSubprocessEnv(
+  config: ProviderConfig,
+  _model: Model<any>,
+  relay: RelayConfig | undefined,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string") env[k] = v;
+  }
+  if (config.configDirOverride) env.CLAUDE_CONFIG_DIR = config.configDirOverride;
+  if (relay) {
+    env.ANTHROPIC_API_KEY = relay.accessToken;
+    env.ANTHROPIC_BASE_URL = relay.baseUrl;
+    // See provider.ts(legacy) comment: stripping Authorization-style env vars
+    // because the relay only accepts x-api-key auth.
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  } else {
+    if (config.apiKeyOverride) env.ANTHROPIC_API_KEY = config.apiKeyOverride;
+    if (config.baseUrlOverride) env.ANTHROPIC_BASE_URL = config.baseUrlOverride;
+  }
+  return env;
+}
+
+/* ----------------------------- message extraction ----------------------------- */
+
+/**
+ * Extract the new user-side content from pi's messages, starting at
+ * `fromIndex`.  Returns a single Anthropic-style content array suitable
+ * for one `SDKUserMessage`.
+ *
+ * In the Option A architecture pi-cas does NOT execute tools, so:
+ *   - We only care about new user messages.
+ *   - Assistant messages are ignored (the SDK already has them).
+ *   - Tool result messages are ignored (the SDK already executed and saw
+ *     the result internally; pi shouldn't be feeding them back).
+ *
+ * If pi sends multiple new user messages (rare but possible if it batches
+ * turns), we concatenate their content blocks.
+ */
+function extractNewUserContent(
+  messages: ReadonlyArray<any>,
+  fromIndex: number,
+): any[] {
+  const blocks: any[] = [];
+  for (let i = fromIndex; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m || m.role !== "user") continue;
+    if (Array.isArray(m.content)) {
+      for (const block of m.content) {
+        const translated = piBlockToAnthropic(block);
+        if (translated) blocks.push(translated);
+      }
+    } else if (typeof m.content === "string") {
+      blocks.push({ type: "text", text: m.content });
+    }
+  }
+  return blocks;
+}
+
+/**
+ * Translate a pi content block into an Anthropic-shaped block the SDK
+ * accepts.  Returns null for blocks we should skip (toolResult — see
+ * extractNewUserContent docstring).
+ */
+function piBlockToAnthropic(block: any): any | null {
+  if (!block || typeof block !== "object") return null;
+  switch (block.type) {
+    case "text":
+      return { type: "text", text: block.text ?? "" };
+    case "image":
+      // Pi uses { type: "image", image: { data, mimeType } } sometimes; the
+      // Anthropic shape is { type: "image", source: { type: "base64", media_type, data } }.
+      if (block.source) return block;  // already Anthropic-shaped
+      if (block.image) {
+        return {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: block.image.mimeType ?? "image/png",
+            data: block.image.data,
+          },
+        };
+      }
+      return null;
+    case "toolResult":
+    case "tool_result":
+      // SDK runs tools internally; ignore any tool_result blocks from pi.
+      return null;
+    default:
+      // Unknown block type — pass through and let the SDK reject it loudly.
+      return block;
+  }
+}
+
+/* ----------------------------- helpers ----------------------------- */
+
+function makeEmptyAssistantMessage(model: Model<any>): any {
+  return {
+    role: "assistant",
+    content: [],
+    api: PROVIDER_ID,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+}
+
+function pushError(
+  stream: AssistantMessageEventStream,
+  model: Model<any>,
+  message: string,
+  bridge?: ReturnType<typeof createEventBridge>,
+): void {
+  const output = bridge ? bridge.getOutput() : makeEmptyAssistantMessage(model);
+  output.stopReason = "error";
+  output.errorMessage = message;
+  stream.push({ type: "error", reason: "error", error: output } as any);
+  stream.end();
+}
+
 /* ----------------------------- slash commands ----------------------------- */
 
 /**
- * Output helper: emit text to the user from a slash command.
- *
- * Always uses `ctx.ui.notify(text, kind)`. We deliberately do NOT use
- * `pi.sendMessage(...)` for slash-command output: pi's `convertToLlm()`
- * unconditionally transforms `role: "custom"` messages into `role: "user"`
- * text messages that get sent to the model on every subsequent turn. So a
- * three-line `/cas-status` reply would silently pollute LLM context with
- * pi-cas plumbing text — the model would see things like "pi-cas fast mode:
- * ON ... $30/$150 per MTok ..." as if the user had said them. The `display`
- * flag on `sendMessage` only controls TUI rendering, not LLM inclusion (the
- * docs are slightly misleading here — verified in messages.js).
- *
- * `appendEntry()` was tempting (it explicitly skips LLM context) but it has
- * no rendering path in the chat scrollback either, so it's strictly worse
- * than notify for our use case.
- *
- * notify handles multi-line text fine; pi renders it as a bordered info/
- * warning/error block in the TUI. The `customType` parameter is retained
- * in the signature for caller-side clarity but is no longer used — notify
- * doesn't take a type label.
+ * Emit text to the user from a slash command via ctx.ui.notify (NOT
+ * pi.sendMessage — see legacy provider.ts for why).
  */
 function emit(
   _pi: ExtensionAPI,
@@ -523,7 +853,11 @@ function emit(
   ctx.ui.notify(text, kind);
 }
 
-function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: FastModeBadge): void {
+function registerSlashCommands(
+  pi: ExtensionAPI,
+  config: ProviderConfig,
+  badge: FastModeBadge,
+): void {
   pi.registerCommand("cas-auth", {
     description: "Show pi-cas-provider auth status",
     handler: async (_args: string, ctx: any) => {
@@ -561,30 +895,17 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
         config.fastModeWarned = false;
         changed = true;
       }
-      // Persist the new preference so it sticks across sessions. Best-effort:
-      // saveState swallows errors, so a read-only home won't break the toggle
-      // for the current session. We only write on actual changes to avoid
-      // touching the file when `/cas-fast` is used as a read.
       if (changed) {
         saveState({ fastMode: config.fastMode });
-        // Reflect the new intent in the badge + event bus immediately. We
-        // intentionally don't pass `actual` here: a toggle doesn't change the
-        // last-turn ground truth (the next turn will). The badge renderer
-        // treats absent `actual` as "unknown / muted".
         badge.update({
           intent: config.fastMode,
           actual: config.fastMode ? config.lastFastModeState : undefined,
           model: config.lastModel,
         });
       }
-
-      // Always emit current state; if changed, lead with the action.
       const heading = changed
         ? `pi-cas fast mode → ${config.fastMode ? "ON" : "off"} (saved)`
         : `pi-cas fast mode: ${config.fastMode ? "ON" : "off"}`;
-      // If env var is set, warn that it will override the persisted value on
-      // next launch — otherwise users will be confused why /cas-fast off
-      // "didn't stick" after a restart.
       const envNote =
         process.env.PI_CAS_FAST_MODE !== undefined
           ? `\n  Note: PI_CAS_FAST_MODE=${process.env.PI_CAS_FAST_MODE} is set; ` +
@@ -609,7 +930,6 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
       return matches.length ? matches.map((o) => ({ value: o, label: o })) : null;
     },
     handler: async (args: string, ctx: any) => {
-      // Accept: `on`, `off`, `status`, `on <provider>`, `<provider>` (sugar for `on <provider>`).
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const first = (parts[0] ?? "status").toLowerCase();
       let action: "on" | "off" | "status";
@@ -622,11 +942,9 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
       } else if (first === "status") {
         action = "status";
       } else {
-        // Bare provider name — treat as `on <provider>`. Friendly shortcut.
         action = "on";
         provider = first;
       }
-
       let changed = false;
       if (action === "on") {
         if (!config.oktaEnabled || config.oktaProvider !== provider) changed = true;
@@ -635,7 +953,6 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
       } else if (action === "off") {
         if (config.oktaEnabled) changed = true;
         config.oktaEnabled = false;
-        // Keep the provider pin so toggling back on remembers it.
       }
       if (changed) {
         saveState({
@@ -645,14 +962,14 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
           },
         });
       }
-
       const stateLine = config.oktaEnabled
         ? `pi-cas okta relay: ON${
-            config.oktaProvider ? ` (provider pinned to "${config.oktaProvider}")` : " (any responder wins)"
+            config.oktaProvider
+              ? ` (provider pinned to "${config.oktaProvider}")`
+              : " (any responder wins)"
           }`
         : "pi-cas okta relay: off";
       const heading = changed ? `→ ${stateLine}` : stateLine;
-
       const detail: string[] = [heading];
       if (config.oktaEnabled) {
         detail.push(
@@ -675,17 +992,69 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
           "  listening on `pi-cas:relay-request`. /cas-status shows the last turn.",
         );
       }
-
       emit(pi, ctx, "pi-cas/okta", detail.join("\n"));
+    },
+  });
+
+  pi.registerCommand("cas-perm", {
+    description:
+      "Set or inspect pi-cas permission mode (bypassPermissions|default|acceptEdits|plan)",
+    getArgumentCompletions: (prefix) => {
+      const opts = ["bypassPermissions", "default", "acceptEdits", "plan", "status"];
+      const matches = opts.filter((o) => o.toLowerCase().startsWith(prefix.toLowerCase()));
+      return matches.length ? matches.map((o) => ({ value: o, label: o })) : null;
+    },
+    handler: async (args: string, ctx: any) => {
+      const arg = args.trim();
+      if (!arg || arg === "status") {
+        emit(
+          pi,
+          ctx,
+          "pi-cas/perm",
+          `pi-cas permission mode: ${config.permissionMode}\n` +
+            `  Default for new sessions.  Mutable per-session via this command.\n` +
+            `  Env override: PI_CAS_PERMISSION_MODE.\n` +
+            `  Persisted to ${statePath()}.`,
+        );
+        return;
+      }
+      const parsed = parsePermissionMode(arg);
+      if (!parsed) {
+        emit(
+          pi,
+          ctx,
+          "pi-cas/perm",
+          `Unknown permission mode: ${arg}\n` +
+            `Valid: bypassPermissions, default, acceptEdits, plan`,
+          "error",
+        );
+        return;
+      }
+      const prev = config.permissionMode;
+      config.permissionMode = parsed;
+      saveState({ permissionMode: parsed });
+      // Push the change to any in-flight long-lived queries.
+      for (const session of config.sessions.values()) {
+        try {
+          await session.query.setPermissionMode(parsed);
+          session.permissionMode = parsed;
+        } catch (err) {
+          if (DEBUG) console.error(`[pi-cas/debug] setPermissionMode failed:`, err);
+        }
+      }
+      emit(
+        pi,
+        ctx,
+        "pi-cas/perm",
+        `pi-cas permission mode → ${parsed} (saved, was ${prev})\n` +
+          `  Applied to ${config.sessions.size} active session(s).`,
+      );
     },
   });
 
   pi.registerCommand("cas-status", {
     description: "Show pi-cas-provider configuration and last-turn ground truth",
     handler: async (_args: string, ctx: any) => {
-      // Distinguish *intent* (what pi-cas will request) from *reality* (what
-      // the API actually returned on the most recent turn). These can diverge:
-      // intent=on + reality=off means the API silently downgraded.
       const intent = config.fastMode ? "on" : "off";
       const realityLabel =
         config.lastFastModeState === undefined
@@ -695,7 +1064,6 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
             : config.lastFastModeState === "cooldown"
               ? "cooldown — fast-mode pool depleted, API throttling"
               : `off — API did not engage fast mode on last turn${config.lastModel ? ` (${config.lastModel})` : ""}`;
-
       const oktaLabel = config.oktaEnabled
         ? `on${config.oktaProvider ? ` (provider=${config.oktaProvider})` : " (any responder)"}`
         : "off";
@@ -704,9 +1072,9 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
         : config.oktaEnabled
           ? "(no successful relay turn yet this session)"
           : "—";
-
       const lines = [
         "pi-cas-provider status:",
+        `  permission mode:     ${config.permissionMode}`,
         `  fast mode (intent):  ${intent}`,
         `  fast mode (actual):  ${realityLabel}`,
         `  okta relay:          ${oktaLabel}`,
@@ -714,13 +1082,9 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
         `  config dir:          ${config.configDirOverride ?? "(default ~/.claude)"}`,
         `  api key override:    ${config.apiKeyOverride ? "PI_CAS_API_KEY set" : "no"}`,
         `  base url override:   ${config.baseUrlOverride ?? "(none — SDK default or ANTHROPIC_BASE_URL)"}`,
-        `  active SDK sessions: ${config.sdkSessionIds.size}`,
+        `  active sessions:     ${config.sessions.size}`,
         `  persisted state:     ${statePath()}`,
       ];
-
-      // Helpful hint when intent and reality disagree. Skip the extra-usage
-      // note in okta mode — the local ~/.claude.json entitlement flag is
-      // irrelevant when traffic is routed through the relay.
       if (config.fastMode && config.lastFastModeState === "off") {
         lines.push("");
         lines.push("Note: you requested fast mode but the API returned off on the last turn.");
@@ -731,7 +1095,6 @@ function registerSlashCommands(pi: ExtensionAPI, config: ProviderConfig, badge: 
           lines.push("  - Does the relay have fast-mode entitlement on its upstream Console org?");
         }
       }
-
       emit(pi, ctx, "pi-cas/status", lines.join("\n"));
     },
   });

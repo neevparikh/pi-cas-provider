@@ -21,8 +21,22 @@ import type {
 } from "@earendil-works/pi-ai";
 import { calculateCost } from "@earendil-works/pi-ai";
 
-import { claudeToPi } from "./tool-shim.js";
 import { PROVIDER_ID } from "./config.js";
+
+/**
+ * In the Option A architecture the SDK runs Claude Code's built-in tools
+ * natively, so we no longer need to translate tool names + argument schemas
+ * back and forth between pi's and CC's conventions.  Pi sees the CC names
+ * directly (Bash, Read, Write, ...) and pi-cas just forwards stream events.
+ * If a future iteration wants pi to display the tool calls with friendlier
+ * labels, that's a presentation concern, not a translation concern.
+ */
+function passThroughTool(name: string, args: Record<string, unknown>): {
+  name: string;
+  arguments: Record<string, unknown>;
+} {
+  return { name, arguments: args };
+}
 
 interface Tracked {
   index: number;                // Anthropic content_block index
@@ -134,7 +148,7 @@ export function createEventBridge(
           // Translate name now so pi sees its own tool names.
           // We'll translate args at content_block_stop once we have the full JSON.
           const piIndex = output.content.length;
-          const { name } = claudeToPi(cb.name, {});
+          const { name } = passThroughTool(cb.name, {});
           output.content.push({
             type: "toolCall", id: cb.id, name, arguments: {},
           } as ToolCall);
@@ -205,7 +219,7 @@ export function createEventBridge(
           let parsedArgs: Record<string, unknown> = {};
           try { parsedArgs = JSON.parse(tracked.partialJson ?? ""); }
           catch { /* leave empty */ }
-          const { arguments: piArgs } = claudeToPi(tracked.claudeName ?? "", parsedArgs);
+          const { arguments: piArgs } = passThroughTool(tracked.claudeName ?? "", parsedArgs);
           (output.content[tracked.piIndex] as ToolCall).arguments = piArgs;
           stream.push({
             type: "toolcall_end", contentIndex: tracked.piIndex,
@@ -228,6 +242,26 @@ export function createEventBridge(
         // pi's tool execution can proceed only after we've seen the final result.
         return;
       }
+
+      case "message_start": {
+        // Anthropic resets `content_block` indices at every assistant
+        // message boundary.  In the Option A architecture, one streamSimple
+        // call may produce MULTIPLE assistant messages (text+tool_use, then
+        // tool ran, then final text — each is its own Anthropic message
+        // with content_block index starting at 0).  Without clearing our
+        // tracked block list here, the second message's content_block
+        // index=0 would collide with the first message's text block and
+        // route its deltas to the wrong pi content entry — most visibly
+        // dropping the final-text reply on tool turns.
+        //
+        // We do NOT clear `output.content` itself: pi's view of the turn
+        // is the concatenation of all assistant content across the multi-
+        // message turn, so we keep appending.  Only the index-keyed
+        // tracked-block bookkeeping resets.
+        if (event.message?.usage) updateUsage(event.message.usage);
+        blocks.length = 0;
+        return;
+      }
     }
   }
 
@@ -240,7 +274,7 @@ export function createEventBridge(
         thinkingSignature: b.signature ?? "",
       } as ThinkingContent);
     } else if (b.type === "tool_use") {
-      const { name, arguments: piArgs } = claudeToPi(b.name, b.input ?? {});
+      const { name, arguments: piArgs } = passThroughTool(b.name, b.input ?? {});
       output.content.push({
         type: "toolCall", id: b.id, name, arguments: piArgs,
       } as ToolCall);

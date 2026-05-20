@@ -1,91 +1,141 @@
 # Continuation context
 
-## What's shipped
+## Status: Option A refactor COMPLETE
 
-Two commits address the "Picking up where I left off" bug:
+The "Picking up where I left off" bug is fixed structurally via a complete
+architectural pivot: long-lived `query()` per pi session, SDK runs all tools
+natively, no on-disk JSONL replay during steady state.
 
-- `9e784f2`: initial synth-asst marker fix — `src/transcript.ts` adds the
-  marker logic, `src/provider.ts` adds `CONTINUATION_HINT` for empty-prompt
-  case, `tests/transcript.test.ts` updated.
-- Follow-up commit (pending): reviewer-feedback fixes — duplicate `toolCallId`
-  pairing bug fixed, `CONTINUATION_HINT` hoisted to module scope with full doc
-  comment, additional test scenarios (isError, unpaired, duplicate-id), README
-  claims about canUseTool corrected.
+### What shipped
 
-73 tests pass. typecheck clean. E2E validated against the real `claude`
-binary + Anthropic API across 5 scenarios (probe code at
-`/tmp/pi-cas-resume-probe/probe-e2e-scenarios.mjs`).
+**New architecture** (`src/provider.ts`):
+- One long-lived `query()` per pi session, lazily spawned on first `streamSimple`.
+- `prompt: AsyncIterable<SDKUserMessage>` stays open for session lifetime.
+- `permissionMode: "bypassPermissions"` (configurable via `/cas-perm`,
+  `PI_CAS_PERMISSION_MODE`, or pi-cas.json).
+- SDK runs every tool natively; pi-cas just forwards `tool_use`/`tool_result`
+  stream events to pi for display.
+- Per-turn: extract new user content from `context.messages.slice(lastSentCount)`,
+  enqueue into the long-lived AsyncIterable, consume SDK events until `result`.
+- Lifecycle: `session_shutdown` tears down + persists sdk_session_id;
+  `session_before_fork` / `session_before_compact` tear down + clear mapping
+  (v1 limitation: model history is lost on fork).
 
-## Important context for someone continuing this
+**Critical implementation details**:
 
-### The pivot from Option B
-The user explicitly asked for "the full refactor and implementation" of Option B (long-lived `query()` per pi session, structurally eliminating the bug). Empirical probing during this work discovered Option B as designed doesn't work cleanly because `canUseTool: deny+interrupt` doesn't reliably fire for benign tool calls — the bundled binary auto-allows in ~3ms, faster than an IPC roundtrip to the canUseTool callback. See `writeups/write_up.md` and `writeups/progress_log.md` for full investigation.
+1. **Persistent iterator** (`PiSession.iter`): captured once via
+   `query[Symbol.asyncIterator]()` and reused across every turn. Using
+   `for await (const msg of query) { ... break }` calls `iter.return()` and
+   CLOSES the generator, so subsequent turns hang forever. Discovered via the
+   e2e probe (scenario 2 hung on the second turn until this was fixed).
 
-This pivot **changed the scope from what the user explicitly asked for**. The committed fix is smaller but verifiably works. If the user wants Option B revisited, see the "Open paths for Option B" section below.
+2. **Event-bridge message_start reset** (`src/event-bridge.ts:246-263`):
+   Anthropic resets `content_block` indices at every assistant message
+   boundary. SDK-runs-tools means one streamSimple call now spans multiple
+   assistant messages (text+tool_use → tool ran → final text are separate
+   Anthropic messages). Must clear the tracked-blocks list on
+   `message_start` to avoid index collisions that route the final text's
+   deltas to the first message's text block (causing empty replies on
+   tool turns).
 
-### Key files
-- `src/transcript.ts` — `piToTranscript` and `appendSynthAssistantMarker`. The new transcript shape ends in a synthetic assistant entry.
-- `src/provider.ts` — `streamViaSDK`. Line ~395: `CONTINUATION_HINT` const + promptGen with the hint fallback.
-- `tests/transcript.test.ts` — `expectSynthMarkerAt` helper + scenario tests.
-- `writeups/write_up.md` — design rationale and failed approaches.
-- `writeups/progress_log.md` — chronological notes.
+3. **lastSentCount divergence detection**: pi sends the full message
+   history on every streamSimple. We extract only `messages.slice(lastSentCount)`
+   and reduce to user-role content blocks (skipping any toolResult blocks —
+   the SDK already saw them internally).
 
-### Probes (kept for reference, not part of pi-cas)
-- `/tmp/pi-cas-resume-probe/probe-warm-multi-turn.mjs` — Option B long-lived query attempt; documented the canUseTool auto-allow blocker.
-- `/tmp/pi-cas-resume-probe/probe-permission.mjs` — minimal repro showing canUseTool DOES fire for not-in-allowlist commands; useful for understanding what triggers vs bypasses canUseTool.
-- `/tmp/pi-cas-resume-probe/probe-e2e-synth-asst.mjs` — single-scenario fix validation.
-- `/tmp/pi-cas-resume-probe/probe-e2e-scenarios.mjs` — 5-scenario fix validation (the main one).
-- `/tmp/pi-cas-build/` — TypeScript build output the probes import from. Rebuild with `npx tsc --noEmit false --outDir /tmp/pi-cas-build --module ESNext --moduleResolution node --allowImportingTsExtensions false --target ES2022 src/transcript.ts src/session-store.ts src/tool-shim.ts` from the pi-cas-provider root.
-- HTTP capture proxy: `/tmp/pi-cas-resume-probe/proxy.mjs`. Start with `PROBE_TAG=warm node proxy.mjs &` then set `ANTHROPIC_BASE_URL=http://127.0.0.1:18284` in probe env.
+**Deleted modules** (no longer needed):
+- `src/transcript.ts` + `tests/transcript.test.ts`
+- `src/session-store.ts`
+- `src/tool-shim.ts` + `tests/tool-shim.test.ts`
+
+**Added**:
+- `/cas-perm <mode>` slash command (in `provider.ts`)
+- `permissionMode` field in `PersistedState` (in `persistence.ts`)
+- `getSessionMapping` / `setSessionMapping` / `clearSessionMapping` helpers
+- `tests/persistence.test.ts` — 15 tests for persistence helpers + mode parsing
+
+### Validation
+
+- **Typecheck clean.** `npx tsc --noEmit` passes.
+- **Unit tests**: 44/44 pass (`tests/persistence.test.ts` is new; relay,
+  http-log-proxy, thinking unchanged).
+- **E2E probe** (`probe-refactor-e2e.mjs` in repo root): 5/5 scenarios pass
+  against the real `claude` binary + Anthropic API:
+  1. First turn, text-only
+  2. Same session, tool turn (the case that originally exposed the
+     iterator-close and message_start bugs)
+  3. No new user content → no-op
+  4. Follow-up question after tool turn
+  5. Post-shutdown lazy respawn
+
+### Accepted limitations (deliberate, documented in README + writeups)
+
+1. **No pi permission UI for tools.** `bypassPermissions` skips all
+   permission checks. Switch to `permissionMode: "default"` via `/cas-perm`
+   if you want the SDK's classifier-+-ask path, but pi-cas does NOT route
+   `can_use_tool` requests to pi's UI — unsafe tools will hang.
+2. **No pi custom tools / extension MCP servers.** Model sees only Claude
+   Code built-ins. Adding them back is Design 1 (pi-tools-as-MCP-bridge);
+   deferred.
+3. **No pi tool-hook translation.** User confirmed they don't use any
+   today. SDK `PreToolUse` hooks are the bridge if needed later.
+4. **Cancel latency.** `query.interrupt()` waits for current tool handler
+   to complete.
+5. **Fork/compact loses model history.** Tear-down-and-respawn for v1.
+   SDK's `forkSession + resumeSessionAt` could preserve; deferred to v2.
+6. **Compaction-summary "Picking back up..." bug.** Separate bug, separate
+   code path. May or may not still occur in new architecture; needs
+   verification.
+
+### Probe locations (kept for reference)
+
+- `/Users/neev/repos/pi-cas-provider/probe-refactor-e2e.mjs` — main e2e
+  validation (lives in repo so it can import deps).
+- `/tmp/pi-cas-resume-probe/probe-sdk-runs-baseline.mjs` — 5-turn baseline
+  validation that built the case for this refactor.
+- `/tmp/pi-cas-resume-probe/probe-sdk-runs-control-apis.mjs` — control APIs
+  (setModel, setPermissionMode, interrupt) validation.
+- `/tmp/pi-cas-resume-probe/probe-sdk-runs-fork.mjs` — `forkSession +
+  resumeSessionAt` validation (not yet wired into pi-cas, but proves the
+  v2 path is viable).
+- Clean SDK config dir for probes: `/tmp/pi-cas-clean-config`.
 - Auth: `ANTHROPIC_API_KEY=$(security find-generic-password -s "Claude Code" -w)`.
 
-### Gotcha: user's ~/.claude/settings.json affects canUseTool firing
-While probing, I discovered that `~/.claude/settings.json` allow rules (like `"Bash(echo:*)"`) cause the binary to auto-allow without going through canUseTool — even when the SDK is invoked with `settingSources: []`. Pi-cas users with permissive settings get more silent SDK auto-execution than users with strict settings. This is an *existing* pi-cas property, not introduced by the fix, but worth knowing.
+### How to rebuild + re-run the e2e probe
 
-### Why "No response requested." and "<synthetic>" specifically
-These are the binary's own internal sentinels (`TGH` and `jG`). The binary synthesizes assistant messages with these values during its own resume-recovery flow. The model has presumably seen this pattern in Claude Code training data. We match the binary's convention so our marker is indistinguishable from one the binary would synthesize itself.
+```bash
+cd /Users/neev/repos/pi-cas-provider
+rm -rf dist-probe
+npx tsc --noEmit false --outDir dist-probe \
+  --module ESNext --moduleResolution node --target ES2022 \
+  --esModuleInterop --skipLibCheck src/*.ts
+export ANTHROPIC_API_KEY=$(security find-generic-password -s "Claude Code" -w)
+export PI_CAS_BUILD=$PWD/dist-probe
+node probe-refactor-e2e.mjs
+```
 
-## Open paths for Option B (if revisited later)
+### Earlier work (pre-refactor synth-marker fix)
 
-From the second-round investigation (post-reviewer feedback), the SDK
-options space has been mapped out:
+Three commits in git history (`9e784f2`, `9433cc3`, `1ebc00f`) implemented a
+transcript-synthesis-layer workaround that's now superseded. The deleted
+modules (transcript.ts, session-store.ts, tool-shim.ts) come from that
+era. The commits remain in history for reference; the synth-marker is no
+longer needed because the bug is structurally impossible in the new
+architecture.
 
-1. **`canUseTool` does not fire reliably.** Confirmed with clean
-   CLAUDE_CONFIG_DIR + every permissionMode + tools/allowedTools variants.
-   The binary's auto-classifier short-circuits canUseTool for benign tools.
+## Open paths (for whoever picks this up next)
 
-2. **`PreToolUse` hook DOES fire reliably.** With `hookSpecificOutput.
-   permissionDecision: "deny"` the hook successfully blocks the tool. But:
-   the subprocess pairs the hook's deny as a synthetic `tool_result`
-   internally, so yielding the real `tool_result` afterward via the gen
-   produces a duplicate `tool_use_id` (Anthropic API rejects). This is the
-   blocker for the obvious Option B implementation.
-
-3. **`PreToolUse` hook with `permissionDecision: "defer"`** — causes the
-   model to retry the tool 3 times then give up. Undesirable.
-
-4. **`hook_deferred_tool` attachment** (documented `dG8` escape): empirically
-   does NOT fire in the SDK resume path. Cause unknown.
-
-5. **SDK-runs-tools (Option A) with long-lived query**: still reachable. Big
-   architectural change — pi-cas's assistant message would no longer include
-   toolCall content blocks; pi-cas would emit them as informational stream
-   events for UI but not as structured content. Pi's permission system would
-   be bypassed (Claude Code's would apply). Custom pi tools still wouldn't
-   be exposed (existing limitation).
-
-6. **Custom MCP tools approach**: register pi's tools as in-process MCP
-   tools (the v0.2 plan). MCP tool calls might route through different
-   permission paths than built-in tools — worth probing.
-
-7. **Binary-level changes / undocumented flags**: there might be an
-   environment variable or flag that disables the auto-classifier. Worth
-   checking with Anthropic if Option B is high priority.
-
-## Pi-cas's pre-existing latent bug worth flagging
-Pi-cas's "canUseTool: deny + iterator break-early" pattern races against the subprocess auto-allowing and running the tool. Production HTTP captures (`/tmp/pi-cas-http-picas.jsonl`) confirm the subprocess DOES auto-run tools (every API request body ends in user, never assistant(tool_use)). Pi ALSO runs the tool via its normal flow, so double-execution happens for non-idempotent tools (Bash side effects, file writes). Users haven't complained loudly so it's not catastrophic, but ideally pi-cas would prevent double execution. This wasn't fixed in the synth-asst commit and isn't introduced by it.
-
-## Next sensible steps
-1. **Spawn task-completion review subagents** (instructions/code/tests) — not yet done.
-2. Decide whether to revisit Option B given the pivot. If yes, see "Open paths" above.
-3. If shipping as-is: make sure the README's "canUseTool: deny so SDK never executes tools" claim is updated to reflect reality (subprocess DOES auto-execute many tool calls). Mentioning this in CHANGELOG too.
+1. **Pi UI for permission prompts.** Add a `can_use_tool` control_request
+   handler that forwards to pi's notification/confirm UI; enable
+   `permissionMode: "default"` as a non-hanging mode.
+2. **Pi custom tools via MCP.** Mirror pi's registered tools into an
+   in-process MCP server (Design 1 from earlier branch); restore parity
+   with v0.x while keeping the SDK-runs-builtins benefits.
+3. **Fork-with-history.** Wire `forkSession + resumeSessionAt` into the
+   `session_before_fork` handler — probe 3 (`probe-sdk-runs-fork.mjs`)
+   already validated this works at the SDK level.
+4. **Compaction-summary bug verification.** Repro the compaction case and
+   check whether the new architecture still triggers "Picking back up...".
+5. **Cancel latency for long built-in tools.** Investigate whether the SDK
+   exposes any per-tool timeout for built-ins (MCP_TOOL_TIMEOUT only
+   covers MCP tools).
