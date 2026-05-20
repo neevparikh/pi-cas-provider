@@ -12,9 +12,9 @@
  *
  * To satisfy pi's invariant without re-running the tool, we register a stub
  * tool for each CC built-in tool name (`Bash`, `Read`, `Write`, `Edit`,
- * `Grep`, `Glob`).  When pi's loop "executes" the stub, it looks up the
- * cached result the SDK already produced (see `tool-result-cache.ts`) and
- * returns it instantly with no side effects.
+ * `Grep`, `Glob`, `WebFetch`, ...).  When pi's loop "executes" the stub, it
+ * looks up the cached result the SDK already produced (see
+ * `tool-result-cache.ts`) and returns it instantly with no side effects.
  *
  * # Naming convention
  *
@@ -33,30 +33,113 @@
  * pi's view of the schema in lockstep with whatever CC version the
  * subprocess happens to be running.
  *
- * # Disallowed CC tools
+ * # Why pre-register every known CC tool name (not rely on the catch-all)
  *
- * We narrow the model's toolset (via SDK's `tools:` option in provider.ts)
- * to exactly the names registered here, so pi never receives a tool call
- * it doesn't know how to handle.
+ * pi-agent-core's `runAgentLoop` takes a one-shot snapshot of `tools` at
+ * the start of each prompt (`agent.js:271-277` → `tools: this._state.tools.slice()`)
+ * and the agent-loop's `currentContext.tools` never re-reads from any live
+ * source thereafter.  So if pi-cas tries to `pi.registerTool(...)` a
+ * brand-new stub mid-segment — e.g. for an `AskUserQuestion` tool_use we
+ * hadn't anticipated — the registration updates `extension.tools` and
+ * `_toolRegistry`, but the snapshot is stale.  Pi then looks up the tool
+ * in the stale snapshot, doesn't find it, and reports `Tool X not found`.
+ *
+ * To work around that, we pre-register a stub for EVERY known CC tool the
+ * subprocess might emit (see {@link SUPPORTED_CC_TOOL_NAMES}).  The list
+ * is derived from the strings in `@anthropic-ai/claude-agent-sdk-darwin-arm64/claude`,
+ * i.e. the bundled subprocess itself.  The dynamic catch-all
+ * ({@link createGenericStub}) is kept only as a defense-in-depth fallback
+ * for genuinely novel tools (MCP servers, future SDK additions); it will
+ * only work on the SECOND occurrence of an unknown name, when the snapshot
+ * for the next prompt picks it up.
  */
 
 import { Type } from "typebox";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
+import type { Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 
 import { take } from "./tool-result-cache.js";
 
 const DEBUG = process.env.PI_CAS_DEBUG === "1";
 
-/** The set of CC built-in tools we expose to the model + stub for pi. */
-export const SUPPORTED_CC_TOOL_NAMES = [
-  "Bash",
-  "Read",
-  "Write",
-  "Edit",
-  "Grep",
-  "Glob",
-] as const;
+/**
+ * Per-tool metadata for every CC tool name the SDK preset can surface
+ * (extracted from strings in the bundled `claude` subprocess binary).
+ *
+ * The `executionMode` choice controls how pi schedules tool calls in the
+ * same assistant message:
+ *  - `parallel`: pure read-only or otherwise safe to interleave (Read,
+ *    Grep, Glob, WebFetch, WebSearch, MCP reads).
+ *  - `sequential`: anything with side effects, anything user-facing (UI
+ *    prompts), or anything we're unsure about.  When in doubt, sequential
+ *    is the safe choice — the cost is mild loss of concurrency, never
+ *    correctness.
+ *
+ * The execution mode of the stub doesn't affect the real tool's behavior
+ * (the SDK already ran it before pi sees it); it only affects whether pi
+ * runs our cache-lookup stubs in parallel.  Cache lookups are O(1) and
+ * non-blocking, so `parallel` is essentially free where it's safe.
+ */
+const TOOL_METADATA: Record<string, { executionMode: "sequential" | "parallel" }> = {
+  // -- six "core" tools (the original SUPPORTED set) ----------------
+  Bash: { executionMode: "sequential" },
+  Read: { executionMode: "parallel" },
+  Write: { executionMode: "sequential" },
+  Edit: { executionMode: "sequential" },
+  Grep: { executionMode: "parallel" },
+  Glob: { executionMode: "parallel" },
+  // -- web / search ------------------------------------------------
+  WebFetch: { executionMode: "parallel" },
+  WebSearch: { executionMode: "parallel" },
+  // -- notebooks ---------------------------------------------------
+  NotebookEdit: { executionMode: "sequential" },
+  // -- todo list ---------------------------------------------------
+  TodoWrite: { executionMode: "sequential" },
+  // -- plan mode ---------------------------------------------------
+  ExitPlanMode: { executionMode: "sequential" },
+  EnterPlanMode: { executionMode: "sequential" },
+  // -- user-facing prompts (cannot be parallelized) ----------------
+  AskUserQuestion: { executionMode: "sequential" },
+  PushNotification: { executionMode: "sequential" },
+  // -- skills / scheduling -----------------------------------------
+  Skill: { executionMode: "sequential" },
+  ScheduleWakeup: { executionMode: "sequential" },
+  Monitor: { executionMode: "sequential" },
+  // -- cron --------------------------------------------------------
+  CronCreate: { executionMode: "sequential" },
+  CronDelete: { executionMode: "sequential" },
+  CronList: { executionMode: "parallel" },
+  // -- worktrees ---------------------------------------------------
+  EnterWorktree: { executionMode: "sequential" },
+  ExitWorktree: { executionMode: "sequential" },
+  // -- pi-style task tracking (these are CC's own task tools, distinct
+  //    from the subagent dispatcher `Agent` / legacy `Task`) -------
+  TaskCreate: { executionMode: "sequential" },
+  TaskGet: { executionMode: "parallel" },
+  TaskList: { executionMode: "parallel" },
+  TaskUpdate: { executionMode: "sequential" },
+  TaskStop: { executionMode: "sequential" },
+  TaskOutput: { executionMode: "sequential" },
+  // -- MCP ---------------------------------------------------------
+  // (Real `mcp__server__tool` names are dynamic; only the catch-all
+  // path can register stubs for those, and only after pi's snapshot
+  // picks them up on the next prompt.)
+};
+
+/**
+ * The set of CC built-in tool names we statically pre-register stubs for.
+ *
+ * Why pre-register everything: see file docstring's "Why pre-register..."
+ * section.  TL;DR — pi-agent-core snapshots `tools` once per prompt, so
+ * dynamic stubs registered mid-segment don't reach the executor.
+ *
+ * Why we don't include `Agent` / `Task` here: those have a richer custom
+ * stub (see `src/task-stub.ts`) registered separately by the provider —
+ * including them here would cause a double-register.
+ */
+export const SUPPORTED_CC_TOOL_NAMES = Object.keys(TOOL_METADATA) as readonly string[];
 export type SupportedCcToolName = (typeof SUPPORTED_CC_TOOL_NAMES)[number];
 
 /**
@@ -167,138 +250,48 @@ export async function executeStub(
 // params arg.  Object-with-passthrough gives a more useful Static type
 // while still accepting anything.)
 
-const bashSchema = Type.Object(
-  {
-    command: Type.Optional(Type.String()),
-    timeout: Type.Optional(Type.Number()),
-  },
-  { additionalProperties: true },
-);
-
-const readSchema = Type.Object(
-  {
-    file_path: Type.Optional(Type.String()),
-    offset: Type.Optional(Type.Number()),
-    limit: Type.Optional(Type.Number()),
-  },
-  { additionalProperties: true },
-);
-
-const writeSchema = Type.Object(
-  {
-    file_path: Type.Optional(Type.String()),
-    content: Type.Optional(Type.String()),
-  },
-  { additionalProperties: true },
-);
-
-const editSchema = Type.Object(
-  {
-    file_path: Type.Optional(Type.String()),
-    old_string: Type.Optional(Type.String()),
-    new_string: Type.Optional(Type.String()),
-    replace_all: Type.Optional(Type.Boolean()),
-  },
-  { additionalProperties: true },
-);
-
-const grepSchema = Type.Object(
-  {
-    pattern: Type.Optional(Type.String()),
-    path: Type.Optional(Type.String()),
-    glob: Type.Optional(Type.String()),
-  },
-  { additionalProperties: true },
-);
-
-const globSchema = Type.Object(
-  {
-    pattern: Type.Optional(Type.String()),
-    path: Type.Optional(Type.String()),
-  },
-  { additionalProperties: true },
-);
+const looseSchema = Type.Object({}, { additionalProperties: true });
 
 /* ----------------------------- factories ----------------------------- */
 
 /**
- * Build all six stub ToolDefinitions.
+ * Build a stub ToolDefinition for one CC tool name.
+ *
+ * The stub's behavior is identical for every name (cache-lookup execute);
+ * the only per-tool customization is `executionMode` (from
+ * {@link TOOL_METADATA}) and `renderCall` (which formats the model's
+ * arguments — Bash command, file path, URL, etc. — so pi shows what the
+ * call was *about*, not just the bare tool name).
+ */
+function createNamedStub(name: string): ToolDefinition {
+  const metadata = TOOL_METADATA[name] ?? { executionMode: "sequential" };
+  return defineTool({
+    name,
+    label: `${name} (claude-code)`,
+    description:
+      `${name} tool. Executed by the Claude Agent SDK; pi-cas retrieves ` +
+      "the result from a per-session cache.",
+    parameters: looseSchema,
+    executionMode: metadata.executionMode,
+    prepareArguments: (args) => (args ?? {}) as any,
+    async execute(toolCallId) {
+      return executeStub(name, toolCallId);
+    },
+    renderCall(args, theme) {
+      return renderToolCallText(name, (args ?? {}) as Record<string, unknown>, theme);
+    },
+  });
+}
+
+/**
+ * Build all named CC stub ToolDefinitions.
  *
  * Called once from `provider.ts` at extension registration; the results are
  * registered via `pi.registerTool`.  Tool definitions are stateless — all
  * runtime state lives in the shared result cache (`tool-result-cache.ts`).
  */
 export function createStubTools(): ToolDefinition[] {
-  return [
-    defineTool({
-      name: "Bash",
-      label: "Bash (claude-code)",
-      description:
-        "Run a shell command. Executed by the Claude Agent SDK; pi-cas " +
-        "retrieves the result from a per-session cache.",
-      parameters: bashSchema,
-      executionMode: "sequential",
-      prepareArguments: (args) => (args ?? {}) as any,
-      async execute(toolCallId) {
-        return executeStub("Bash", toolCallId);
-      },
-    }),
-    defineTool({
-      name: "Read",
-      label: "Read (claude-code)",
-      description: "Read a file. Executed by the Claude Agent SDK.",
-      parameters: readSchema,
-      executionMode: "parallel",
-      prepareArguments: (args) => (args ?? {}) as any,
-      async execute(toolCallId) {
-        return executeStub("Read", toolCallId);
-      },
-    }),
-    defineTool({
-      name: "Write",
-      label: "Write (claude-code)",
-      description: "Write a file. Executed by the Claude Agent SDK.",
-      parameters: writeSchema,
-      executionMode: "sequential",
-      prepareArguments: (args) => (args ?? {}) as any,
-      async execute(toolCallId) {
-        return executeStub("Write", toolCallId);
-      },
-    }),
-    defineTool({
-      name: "Edit",
-      label: "Edit (claude-code)",
-      description: "Edit a file. Executed by the Claude Agent SDK.",
-      parameters: editSchema,
-      executionMode: "sequential",
-      prepareArguments: (args) => (args ?? {}) as any,
-      async execute(toolCallId) {
-        return executeStub("Edit", toolCallId);
-      },
-    }),
-    defineTool({
-      name: "Grep",
-      label: "Grep (claude-code)",
-      description: "Search file contents. Executed by the Claude Agent SDK.",
-      parameters: grepSchema,
-      executionMode: "parallel",
-      prepareArguments: (args) => (args ?? {}) as any,
-      async execute(toolCallId) {
-        return executeStub("Grep", toolCallId);
-      },
-    }),
-    defineTool({
-      name: "Glob",
-      label: "Glob (claude-code)",
-      description: "Find files by glob pattern. Executed by the Claude Agent SDK.",
-      parameters: globSchema,
-      executionMode: "parallel",
-      prepareArguments: (args) => (args ?? {}) as any,
-      async execute(toolCallId) {
-        return executeStub("Glob", toolCallId);
-      },
-    }),
-  ];
+  return SUPPORTED_CC_TOOL_NAMES.map(createNamedStub);
 }
 
 /**
@@ -306,10 +299,11 @@ export function createStubTools(): ToolDefinition[] {
  *
  * Used by the event bridge for sanity warnings — if the SDK ever emits a
  * tool_use whose name isn't in this set, pi's loop will fail with
- * `Tool <name> not found`.
+ * `Tool <name> not found` UNLESS our catch-all dynamic registration runs
+ * (which only helps on a SUBSEQUENT prompt — see file docstring).
  */
 export function isSupportedStubTool(name: string): name is SupportedCcToolName {
-  return (SUPPORTED_CC_TOOL_NAMES as readonly string[]).includes(name);
+  return Object.prototype.hasOwnProperty.call(TOOL_METADATA, name);
 }
 
 /**
@@ -330,20 +324,26 @@ export function isValidDynamicToolName(name: string): boolean {
  * with pi just-in-time, so pi's agent loop has a tool to execute and won't
  * crash with `Tool <name> not found`.
  *
+ * **Caveat — see file docstring "Why pre-register every known CC tool name":**
+ * pi-agent-core takes a one-shot tool snapshot at the start of each prompt.
+ * A dynamic registration mid-segment will NOT reach the executor for that
+ * prompt — pi has already snapshotted the tool list.  The stub will only
+ * be visible on the NEXT prompt, after pi takes a fresh snapshot.
+ *
+ * So this path is best-effort:
+ *  - First time the unknown tool fires: pi reports "Tool X not found" and
+ *    surfaces an error tool_result.  The dynamic stub is registered, but
+ *    too late for THIS prompt.
+ *  - Second time (in a subsequent prompt): the snapshot includes our stub,
+ *    pi executes it, the cache lookup succeeds.
+ *
+ * For tools we know about, pre-register them statically in
+ * {@link TOOL_METADATA} instead.
+ *
  * The stub's `execute()` looks up the SDK-cached result by toolCallId just
  * like the named stubs.  The schema is the loosest possible
  * (additionalProperties: true on an empty object), since the SDK has already
  * validated the model's arguments against the real tool's schema.
- *
- * **Why dynamic (not statically pre-registered):** we cannot enumerate every
- * tool a current or future CC release might surface — skills can activate
- * tools, MCP servers contribute tools with arbitrary names, and the CC
- * built-in surface evolves.  A catch-all keeps pi alive across these
- * surprises without requiring us to ship a new pi-cas version each time.
- *
- * The `tools:` restriction we pass to the SDK in provider.ts already keeps
- * the model's main toolset narrow.  This catch-all is the safety net for
- * leaks (skill activations, future CC additions, etc.).
  */
 export function createGenericStub(name: string): ToolDefinition {
   if (!isValidDynamicToolName(name)) {
@@ -362,9 +362,7 @@ export function createGenericStub(name: string): ToolDefinition {
       "runtime after the Claude Agent SDK emitted a tool_use block with " +
       "this name.  The SDK executes the tool natively; pi-cas retrieves " +
       "the result from a per-session cache.",
-    // The model can't see this stub's schema (only the SDK's view matters),
-    // so we use the loosest possible parameters object.
-    parameters: Type.Object({}, { additionalProperties: true }),
+    parameters: looseSchema,
     // Conservative default: assume tools we don't know about could have
     // side effects.  Run sequentially so pi doesn't race their cache
     // lookups against each other or against side-effecting siblings.
@@ -373,5 +371,264 @@ export function createGenericStub(name: string): ToolDefinition {
     async execute(toolCallId) {
       return executeStub(name, toolCallId);
     },
+    renderCall(args, theme) {
+      return renderToolCallText(name, (args ?? {}) as Record<string, unknown>, theme);
+    },
   });
+}
+
+/* ----------------------------- renderCall formatting ----------------------------- */
+
+/**
+ * Render a tool call's arguments as a short one-line summary suitable for
+ * pi's tool-call display.  Pi already shows the tool's label on its own
+ * line (e.g. "Bash (claude-code)"); we render the INPUT — the actual
+ * command, file path, URL, query — so the user can see what the call was
+ * about without expanding.
+ *
+ * Format is modeled on pi-subagent's `formatToolCall` and on what each CC
+ * tool's UI shows in the regular CC client:
+ *
+ *   Bash             $ git log --oneline -10
+ *   Read             ~/repos/foo/bar.ts:42-100
+ *   Write            ~/repos/foo/bar.ts (250 lines)
+ *   Edit             ~/repos/foo/bar.ts
+ *   Grep             /pattern/ in src
+ *   Glob             **\/*.ts in .
+ *   AskUserQuestion  Which approach? (+ 2 more questions)
+ *   TodoWrite        5 todos (3 in_progress)
+ *   WebFetch         https://example.com/docs
+ *   WebSearch        "claude code release notes"
+ *
+ * Returned as a {@link Component} (pi-tui `Text`) so pi can lay it out
+ * alongside the standard tool framing.
+ */
+export function renderToolCallText(
+  toolName: string,
+  args: Record<string, unknown>,
+  theme: Theme,
+): Component {
+  return new Text(formatToolCall(toolName, args, theme), 0, 0);
+}
+
+/**
+ * Compact per-call formatting modeled on pi-subagent's `formatToolCall`,
+ * adapted to CC's PascalCase tool names.  Returns a single line (or
+ * multi-line for tools where that's more informative, like AskUserQuestion).
+ *
+ * Exported for reuse in {@link createTaskStub}'s subagent transcript
+ * renderer (each transcript line shows the subagent's tool call in this
+ * same compact form).
+ */
+export function formatToolCall(
+  toolName: string,
+  args: Record<string, unknown>,
+  theme: Pick<Theme, "fg">,
+): string {
+  const fg = theme.fg.bind(theme);
+  const home = process.env.HOME ?? "";
+  const shortenPath = (p: string) =>
+    home && p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+  const truncate = (s: string, n: number) =>
+    s.length > n ? `${s.slice(0, n)}...` : s;
+
+  switch (toolName) {
+    /* -- core file/shell tools ------------------------------------- */
+    case "Bash": {
+      const command = (args.command as string) ?? "...";
+      return fg("muted", "$ ") + fg("toolOutput", truncate(command, 120));
+    }
+    case "Read": {
+      const filePath = shortenPath((args.file_path as string) ?? "...");
+      const offset = args.offset as number | undefined;
+      const limit = args.limit as number | undefined;
+      let text = fg("accent", filePath);
+      if (offset !== undefined || limit !== undefined) {
+        const startLine = offset ?? 1;
+        const endLine = limit !== undefined ? startLine + limit - 1 : "";
+        text += fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+      }
+      return text;
+    }
+    case "Write": {
+      const filePath = shortenPath((args.file_path as string) ?? "...");
+      const content = (args.content as string) ?? "";
+      const lines = content ? content.split("\n").length : 0;
+      let text = fg("accent", filePath);
+      if (lines > 1) text += fg("dim", ` (${lines} lines)`);
+      return text;
+    }
+    case "Edit": {
+      const filePath = shortenPath((args.file_path as string) ?? "...");
+      // For single-string edits, show a tiny preview of what we're searching
+      // for, since the path alone doesn't disambiguate multiple edits in
+      // the same file.
+      const oldStr = (args.old_string as string) ?? "";
+      const replaceAll = args.replace_all === true;
+      let text = fg("accent", filePath);
+      if (oldStr) {
+        const firstLine = oldStr.split("\n")[0]?.trim() ?? "";
+        text += fg("dim", ` ${truncate(firstLine, 40)}`);
+      }
+      if (replaceAll) text += fg("warning", " (all)");
+      return text;
+    }
+    case "Grep": {
+      const pattern = (args.pattern as string) ?? "";
+      const path = shortenPath((args.path as string) ?? ".");
+      const glob = args.glob as string | undefined;
+      let text = fg("accent", `/${pattern}/`) + fg("dim", ` in ${path}`);
+      if (glob) text += fg("dim", ` --glob ${glob}`);
+      return text;
+    }
+    case "Glob": {
+      const pattern = (args.pattern as string) ?? "*";
+      const path = shortenPath((args.path as string) ?? ".");
+      return fg("accent", pattern) + fg("dim", ` in ${path}`);
+    }
+    /* -- subagent (Task / Agent) ----------------------------------- */
+    case "Task":
+    case "Agent": {
+      const subType = (args.subagent_type as string) ?? "default";
+      const desc = ((args.description as string) ?? (args.prompt as string) ?? "").slice(0, 60);
+      return fg("accent", subType) + fg("dim", ` ${desc}`);
+    }
+    /* -- web / search ---------------------------------------------- */
+    case "WebFetch": {
+      const url = (args.url as string) ?? "...";
+      return fg("accent", truncate(url, 100));
+    }
+    case "WebSearch": {
+      const query = (args.query as string) ?? "...";
+      return fg("accent", `"${truncate(query, 100)}"`);
+    }
+    /* -- notebooks ------------------------------------------------- */
+    case "NotebookEdit": {
+      const path = shortenPath((args.notebook_path as string) ?? "...");
+      const cellId = args.cell_id as string | undefined;
+      const editMode = (args.edit_mode as string | undefined) ?? "replace";
+      let text = fg("accent", path) + fg("dim", ` [${editMode}]`);
+      if (cellId) text += fg("dim", ` cell=${truncate(cellId, 20)}`);
+      return text;
+    }
+    /* -- todo list ------------------------------------------------- */
+    case "TodoWrite": {
+      const todos = (args.todos as Array<{ status?: string }> | undefined) ?? [];
+      const total = todos.length;
+      const inProgress = todos.filter((t) => t?.status === "in_progress").length;
+      const completed = todos.filter((t) => t?.status === "completed").length;
+      const parts = [`${total} todo${total === 1 ? "" : "s"}`];
+      if (inProgress > 0) parts.push(`${inProgress} in_progress`);
+      if (completed > 0) parts.push(`${completed} done`);
+      return fg("accent", parts.join(", "));
+    }
+    /* -- user prompts ---------------------------------------------- */
+    case "AskUserQuestion": {
+      const questions = (args.questions as Array<{ question?: string }> | undefined) ?? [];
+      if (questions.length === 0) return fg("muted", "(no questions)");
+      const first = truncate(questions[0]?.question ?? "", 100);
+      let text = fg("accent", first);
+      if (questions.length > 1) {
+        text += fg("dim", ` (+${questions.length - 1} more)`);
+      }
+      return text;
+    }
+    case "PushNotification": {
+      const message = (args.message as string) ?? "";
+      return fg("accent", truncate(message, 120));
+    }
+    /* -- plan mode ------------------------------------------------- */
+    case "ExitPlanMode": {
+      const plan = (args.plan as string) ?? "";
+      const firstLine = plan.split("\n")[0]?.trim() ?? "";
+      return fg("dim", truncate(firstLine, 100));
+    }
+    case "EnterPlanMode": {
+      return fg("dim", "(enter plan mode)");
+    }
+    /* -- skills / scheduling --------------------------------------- */
+    case "Skill": {
+      const skill = (args.skill as string) ?? "?";
+      const skillArgs = (args.args as string) ?? "";
+      let text = fg("accent", skill);
+      if (skillArgs) text += fg("dim", ` ${truncate(skillArgs, 80)}`);
+      return text;
+    }
+    case "ScheduleWakeup": {
+      const delay = args.delaySeconds as number | undefined;
+      const reason = (args.reason as string) ?? "";
+      let text = fg("accent", delay !== undefined ? `+${delay}s` : "?");
+      if (reason) text += fg("dim", ` ${truncate(reason, 80)}`);
+      return text;
+    }
+    case "Monitor": {
+      const description = (args.description as string) ?? "";
+      const cmd = (args.command as string) ?? "";
+      let text = fg("accent", truncate(description, 60));
+      if (cmd) text += "\n" + fg("muted", "$ ") + fg("dim", truncate(cmd, 80));
+      return text;
+    }
+    /* -- cron ------------------------------------------------------ */
+    case "CronCreate": {
+      const cron = (args.cron as string) ?? "?";
+      const prompt = (args.prompt as string) ?? "";
+      return fg("accent", cron) + (prompt ? fg("dim", ` → ${truncate(prompt, 80)}`) : "");
+    }
+    case "CronDelete": {
+      const id = (args.id as string) ?? "?";
+      return fg("accent", id);
+    }
+    case "CronList": {
+      return fg("dim", "(list cron jobs)");
+    }
+    /* -- worktrees ------------------------------------------------- */
+    case "EnterWorktree": {
+      const name = (args.name as string) ?? (args.path as string) ?? "(auto)";
+      return fg("accent", name);
+    }
+    case "ExitWorktree": {
+      const action = (args.action as string) ?? "?";
+      const discard = args.discard_changes === true ? " (discarding changes)" : "";
+      return fg("accent", action) + fg("warning", discard);
+    }
+    /* -- CC's task tracking ---------------------------------------- */
+    case "TaskCreate": {
+      const subject = (args.subject as string) ?? "...";
+      return fg("accent", truncate(subject, 100));
+    }
+    case "TaskGet": {
+      const id = (args.taskId as string) ?? "?";
+      return fg("accent", id);
+    }
+    case "TaskUpdate": {
+      const id = (args.taskId as string) ?? "?";
+      const status = args.status as string | undefined;
+      let text = fg("accent", id);
+      if (status) text += fg("dim", ` → ${status}`);
+      return text;
+    }
+    case "TaskList": {
+      return fg("dim", "(list tasks)");
+    }
+    case "TaskOutput":
+    case "TaskStop": {
+      const id = (args.task_id as string) ?? (args.shell_id as string) ?? "?";
+      return fg("accent", id);
+    }
+    /* -- generic fallback ------------------------------------------ */
+    default: {
+      // Strip out very large fields (full file contents, base64, etc.) so the
+      // JSON preview is informative rather than overwhelming.
+      const trimmed: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(args ?? {})) {
+        if (typeof v === "string" && v.length > 80) {
+          trimmed[k] = `${v.slice(0, 60)}...`;
+        } else {
+          trimmed[k] = v;
+        }
+      }
+      const argsStr = JSON.stringify(trimmed);
+      return fg("dim", truncate(argsStr, 120));
+    }
+  }
 }

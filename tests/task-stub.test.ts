@@ -14,7 +14,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { clear as clearCache, put } from "../src/tool-result-cache.js";
-import { createTaskStub, formatToolCall, TASK_TOOL_NAME } from "../src/task-stub.js";
+import { createTaskStub, TASK_TOOL_NAME } from "../src/task-stub.js";
+import { formatToolCall } from "../src/stub-tools.js";
 
 const noopTheme = {
   fg: (_color: any, text: string) => text,
@@ -156,9 +157,12 @@ describe("formatToolCall", () => {
     expect(ls).toContain("...");
   });
 
+  // Note: the formatter renders ONLY the input (file path, command, URL,
+  // etc.) — not the tool name.  Pi already displays the tool's label on its
+  // own line (e.g. "Bash (claude-code)"); duplicating it here would be noise.
+
   it("renders Read with file path (and optional offset/limit annotation)", () => {
     const s = formatToolCall("Read", { file_path: "/tmp/foo.txt" }, noopTheme);
-    expect(s).toContain("read");
     expect(s).toContain("/tmp/foo.txt");
     const s2 = formatToolCall("Read", { file_path: "/tmp/x", offset: 10, limit: 5 }, noopTheme);
     expect(s2).toMatch(/:10-14/);
@@ -166,44 +170,103 @@ describe("formatToolCall", () => {
 
   it("renders Write with line count when content has > 1 line", () => {
     const s = formatToolCall("Write", { file_path: "/tmp/x", content: "a\nb\nc" }, noopTheme);
-    expect(s).toContain("write");
+    expect(s).toContain("/tmp/x");
     expect(s).toContain("3 lines");
   });
 
-  it("renders Edit with file path", () => {
+  it("renders Edit with file path and optional old_string preview", () => {
     const s = formatToolCall("Edit", { file_path: "/tmp/x" }, noopTheme);
-    expect(s).toMatch(/edit/);
     expect(s).toContain("/tmp/x");
+    const s2 = formatToolCall(
+      "Edit",
+      { file_path: "/tmp/x", old_string: "const foo = 1", replace_all: true },
+      noopTheme,
+    );
+    expect(s2).toContain("/tmp/x");
+    expect(s2).toContain("const foo = 1");
+    expect(s2).toContain("(all)");
   });
 
-  it("renders Grep as `grep /pattern/ in <path>`", () => {
+  it("renders Grep as `/pattern/ in <path>`", () => {
     const s = formatToolCall("Grep", { pattern: "foo", path: "/tmp" }, noopTheme);
-    expect(s).toContain("grep");
     expect(s).toContain("/foo/");
     expect(s).toContain("/tmp");
   });
 
-  it("renders Glob as `glob <pattern> in <path>`", () => {
+  it("renders Glob with pattern", () => {
     const s = formatToolCall("Glob", { pattern: "*.ts" }, noopTheme);
-    expect(s).toContain("glob");
     expect(s).toContain("*.ts");
   });
 
-  it("renders nested Task as `Task <subagent_type> <description>`", () => {
+  it("renders nested Task with subagent type + description", () => {
     const s = formatToolCall(
       "Task",
       { subagent_type: "Explore", description: "find stuff" },
       noopTheme,
     );
-    expect(s).toContain("Task");
     expect(s).toContain("Explore");
     expect(s).toContain("find stuff");
   });
 
-  it("renders unknown tool name as `<name> <argsPreview>`", () => {
+  it("renders Agent like Task (subagent dispatcher alias)", () => {
+    const s = formatToolCall(
+      "Agent",
+      { subagent_type: "Explore", description: "find stuff" },
+      noopTheme,
+    );
+    expect(s).toContain("Explore");
+    expect(s).toContain("find stuff");
+  });
+
+  it("renders WebFetch with URL", () => {
     const s = formatToolCall("WebFetch", { url: "https://example.com" }, noopTheme);
-    expect(s).toContain("WebFetch");
     expect(s).toContain("https://example.com");
+  });
+
+  it("renders WebSearch with quoted query", () => {
+    const s = formatToolCall("WebSearch", { query: "claude code" }, noopTheme);
+    expect(s).toContain("\"claude code\"");
+  });
+
+  it("renders AskUserQuestion with first question + count of additional", () => {
+    const s = formatToolCall(
+      "AskUserQuestion",
+      {
+        questions: [
+          { question: "Which library?" },
+          { question: "Which approach?" },
+          { question: "Which timeout?" },
+        ],
+      },
+      noopTheme,
+    );
+    expect(s).toContain("Which library?");
+    expect(s).toContain("+2 more");
+  });
+
+  it("renders TodoWrite with todo count + in_progress count", () => {
+    const s = formatToolCall(
+      "TodoWrite",
+      {
+        todos: [
+          { status: "completed" },
+          { status: "completed" },
+          { status: "in_progress" },
+          { status: "pending" },
+        ],
+      },
+      noopTheme,
+    );
+    expect(s).toContain("4 todos");
+    expect(s).toContain("1 in_progress");
+    expect(s).toContain("2 done");
+  });
+
+  it("falls back to JSON preview for unknown tool names", () => {
+    const s = formatToolCall("SomeNovelTool", { foo: "bar", n: 42 }, noopTheme);
+    expect(s).toContain("foo");
+    expect(s).toContain("bar");
+    expect(s).toContain("42");
   });
 
   it("home directory paths are shortened to ~", () => {

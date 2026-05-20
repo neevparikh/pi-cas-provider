@@ -45,7 +45,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { defineTool, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 
-import { executeStub } from "./stub-tools.js";
+import { executeStub, formatToolCall } from "./stub-tools.js";
 import type { SubagentTranscript } from "./subagent-transcript.js";
 
 /**
@@ -249,79 +249,6 @@ function renderDisplayItem(
     return theme.fg("dim", `💭 ${preview}`);
   }
   return theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme);
-}
-
-/**
- * Compact per-call formatting modeled on pi-subagent's `formatToolCall`,
- * adapted to CC's PascalCase tool names (Bash, Read, Write, Edit, Grep,
- * Glob, plus generic fallback for everything else).
- */
-export function formatToolCall(
-  toolName: string,
-  args: Record<string, unknown>,
-  theme: { fg: (color: any, text: string) => string },
-): string {
-  const fg = theme.fg.bind(theme);
-  const home = process.env.HOME ?? "";
-  const shortenPath = (p: string) =>
-    home && p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-
-  switch (toolName) {
-    case "Bash": {
-      const command = (args.command as string) ?? "...";
-      const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
-      return fg("muted", "$ ") + fg("toolOutput", preview);
-    }
-    case "Read": {
-      const filePath = shortenPath((args.file_path as string) ?? "...");
-      const offset = args.offset as number | undefined;
-      const limit = args.limit as number | undefined;
-      let text = fg("accent", filePath);
-      if (offset !== undefined || limit !== undefined) {
-        const startLine = offset ?? 1;
-        const endLine = limit !== undefined ? startLine + limit - 1 : "";
-        text += fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-      }
-      return fg("muted", "read ") + text;
-    }
-    case "Write": {
-      const filePath = shortenPath((args.file_path as string) ?? "...");
-      const content = (args.content as string) ?? "";
-      const lines = content ? content.split("\n").length : 0;
-      let text = fg("muted", "write ") + fg("accent", filePath);
-      if (lines > 1) text += fg("dim", ` (${lines} lines)`);
-      return text;
-    }
-    case "Edit": {
-      const filePath = shortenPath((args.file_path as string) ?? "...");
-      return fg("muted", "edit ") + fg("accent", filePath);
-    }
-    case "Grep": {
-      const pattern = (args.pattern as string) ?? "";
-      const filePath = shortenPath((args.path as string) ?? ".");
-      return (
-        fg("muted", "grep ") +
-        fg("accent", `/${pattern}/`) +
-        fg("dim", ` in ${filePath}`)
-      );
-    }
-    case "Glob": {
-      const pattern = (args.pattern as string) ?? "*";
-      const filePath = shortenPath((args.path as string) ?? ".");
-      return fg("muted", "glob ") + fg("accent", pattern) + fg("dim", ` in ${filePath}`);
-    }
-    case "Task": {
-      // Nested Task call — render the same way Task renders its call.
-      const subType = (args.subagent_type as string) ?? "default";
-      const desc = ((args.description as string) ?? (args.prompt as string) ?? "").slice(0, 60);
-      return fg("muted", "Task ") + fg("accent", subType) + fg("dim", ` ${desc}`);
-    }
-    default: {
-      const argsStr = JSON.stringify(args ?? {});
-      const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-      return fg("accent", toolName) + fg("dim", ` ${preview}`);
-    }
-  }
 }
 
 function formatTokens(count: number): string {

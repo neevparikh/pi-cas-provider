@@ -342,8 +342,11 @@ export function registerProvider(pi: ExtensionAPI): void {
     }
     console.warn(
       `[pi-cas] registered catch-all stub for SDK-emitted tool "${toolName}" ` +
-        "(not in SUPPORTED_CC_TOOL_NAMES).  See README \"Known caveats\" " +
-        "for details on the restricted tool surface.",
+        "(not in SUPPORTED_CC_TOOL_NAMES).  Note: due to pi-agent-core's " +
+        "one-shot tool snapshot per prompt, the FIRST occurrence of this " +
+        "tool in the current prompt will surface as `Tool not found` — " +
+        "the stub becomes effective on the next prompt.  If this tool is " +
+        "a CC built-in (not MCP), add it to TOOL_METADATA in stub-tools.ts.",
     );
   };
 

@@ -30,12 +30,23 @@ describe("stub-tools", () => {
     expect(stubs.map((t) => t.name).sort()).toEqual([...SUPPORTED_CC_TOOL_NAMES].sort());
   });
 
-  it("isSupportedStubTool recognizes CC names only", () => {
+  it("isSupportedStubTool recognizes CC names from the pre-registered table", () => {
+    // Sample core + extended names — the full list is in TOOL_METADATA.
     expect(isSupportedStubTool("Bash")).toBe(true);
     expect(isSupportedStubTool("Read")).toBe(true);
-    expect(isSupportedStubTool("bash")).toBe(false); // lowercase — pi's built-in
-    expect(isSupportedStubTool("WebFetch")).toBe(false); // not stubbed
+    expect(isSupportedStubTool("WebFetch")).toBe(true);
+    expect(isSupportedStubTool("AskUserQuestion")).toBe(true);
+    expect(isSupportedStubTool("TodoWrite")).toBe(true);
+    expect(isSupportedStubTool("NotebookEdit")).toBe(true);
+    // lowercase is pi's built-in namespace, not ours:
+    expect(isSupportedStubTool("bash")).toBe(false);
+    // `Task` / `Agent` get registered as the rich Task stub by the
+    // provider, NOT through the named-stub list — so they should NOT
+    // appear here.  See task-stub.ts.
+    expect(isSupportedStubTool("Task")).toBe(false);
+    expect(isSupportedStubTool("Agent")).toBe(false);
     expect(isSupportedStubTool("")).toBe(false);
+    expect(isSupportedStubTool("NotARealTool")).toBe(false);
   });
 
   it("execute() returns cached content and details", async () => {
