@@ -411,15 +411,24 @@ function registerLifecycleHooks(pi: ExtensionAPI, config: ProviderConfig): void 
       // Mapping policy:
       //   - "quit": hard shutdown.  Keep the mapping so the next pi launch
       //     can resume.
+      //   - "reload": `/reload` rebuilds the extension runtime but keeps the
+      //     SAME pi session id / session file.  Keep the mapping so the
+      //     reloaded extension's first streamSimple resumes the existing
+      //     SDK transcript — otherwise the model loses all prior context
+      //     even though pi's visible transcript is unchanged.
       //   - "fork": the OLD session is being abandoned for a new one.  Keep
       //     the mapping for the old pi session id, since the user might
       //     navigate back to it later.  The fork itself was already wired up
       //     in `session_before_fork` (forkSession + pendingFork stash); the
       //     NEW pi session id will pick that up on its first streamSimple.
-      //   - "reload" / "new" / "resume": the pi session is being replaced
-      //     wholesale.  Clear the mapping so the next pi-cas session for
-      //     this id starts fresh.
-      if (event.reason !== "quit" && event.reason !== "fork") {
+      //   - "new" / "resume": the pi session is being replaced wholesale
+      //     (different session file).  Clear the mapping so the next
+      //     pi-cas session for this id starts fresh.
+      if (
+        event.reason !== "quit" &&
+        event.reason !== "reload" &&
+        event.reason !== "fork"
+      ) {
         clearSessionMapping(piId);
       }
     }
