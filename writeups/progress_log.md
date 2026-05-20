@@ -1,3 +1,258 @@
+## Catch-all stub + fork/compact preservation + subagent investigation 05/20/2026 - HEAD
+
+### Motivation
+
+User-requested follow-ups from the deferred list (`continuation_context.md`):
+1. Catch-all stub for unknown CC tools so pi doesn't crash with
+   `Tool <name> not found` if the SDK ever surfaces a tool we didn't
+   pre-register.
+2. Fork/compact preservation (was: tear-down-and-respawn, model history
+   lost).
+3. Investigate how the SDK exposes subagents and what pi would see.
+
+### Shipped
+
+**Phase 1 — catch-all stub:**
+- `src/stub-tools.ts`: added `createGenericStub(name)`,
+  `isValidDynamicToolName(name)`, `VALID_DYNAMIC_TOOL_NAME` regex.
+- `src/event-bridge.ts`: `createEventBridge(model, options)` second arg
+  with optional `onUnknownToolName(name)` callback.  Bridge fires the
+  callback on `content_block_start` for tool_use blocks not in
+  `SUPPORTED_CC_TOOL_NAMES`, and on the diagnostic `appendFinalBlock`
+  path.  Callback throws are caught + logged so they don't corrupt the
+  segment.
+- `src/config.ts`: added `ProviderConfig.registerDynamicStub` field.
+- `src/provider.ts`: `registerProvider` sets up
+  `config.registerDynamicStub`.  Tracks registered names in a closure
+  Set seeded from `SUPPORTED_CC_TOOL_NAMES`.  Validates name, calls
+  `pi.registerTool(createGenericStub(name))`, warns to stderr
+  (visible without DEBUG).  Bridge creation passes the callback.
+
+**Phase 2 — fork/compact preservation:**
+- Added `forkSession` import from `@anthropic-ai/claude-agent-sdk`.
+- `src/config.ts`: added `ProviderConfig.pendingFork` field.
+- `src/provider.ts` `session_before_fork` handler: now calls
+  `sdkForkSession(sdkSessionId)`, stashes the new SDK session id in
+  `config.pendingFork`.  Tears down the live query but does NOT clear
+  the source mapping (preserves backward navigation).  Falls back to
+  v1 behavior on `forkSession()` failure (logs warning).
+- `src/provider.ts` `session_before_compact` handler: no longer tears
+  down.  Flags every active session with `needsLastSentReset`.
+- `src/provider.ts` `session_shutdown` handler: now also keeps the
+  mapping on `reason === "fork"` (was: only `"quit"`).
+- `interface PiSession`: added `needsLastSentReset?: boolean`.
+- `streamSimple`: before classification, if `needsLastSentReset`, reset
+  `lastSentCount = initialLastSentCount(messages.length)`.  Clears flag.
+- `ensureSession`: now calls extracted helper
+  `resolveResumeForFreshSession(piId, pendingFork, persistedId)` to
+  decide the resume id.  If pendingFork is consumed, persists the new
+  mapping and clears the stash.
+- `resolveResumeForFreshSession` exported for testing.
+
+**Phase 3 — subagent investigation (no code; deliverable is docs):**
+- `writeups/subagent_investigation.md`: full coverage of SDK surface
+  (Task tool, AgentDefinition, parent_tool_use_id, task_* events,
+  forwardSubagentText), required bridge changes, phasing recommendation
+  (Phase A passive support → Phase B nested-transcript rendering),
+  open questions for empirical resolution.
+- `probe-subagent-events.mjs`: companion probe that delegates to a
+  subagent and logs every SDK event with subagent metadata visible.
+  Includes `PROBE_DUMP_PATH` env for JSON dump.  Syntax-checked but
+  NOT run against the real API in this commit — needs the user to
+  validate when they have API access + want to make a decision on
+  subagent support.
+
+**Phase 5 — subagent Phase B: nested-transcript rendering (added on
+further user request, modeled on
+[pi-subagent](https://github.com/mariozechner/pi-subagent)):**
+
+User asked: "can we try and display subagent reasoning/outputs/toolcalls
+the way that the pi-subagent extension works?".  Read pi-subagent's
+src/index.ts to understand its rendering approach (Container +
+Markdown + Text + Spacer via @mariozechner/pi-tui; per-tool-name
+formatting via `formatToolCall`; collapsed/expanded modes; usage
+stats line).  Adapted it for pi-cas's architecture: instead of
+spawning child pi processes and parsing JSON-mode events, we
+collect the SDK's typed subagent events into a transcript and
+render it at result-time.
+
+Changes:
+- **`src/subagent-transcript.ts`** (new): module singleton
+  `Map<parentToolUseId, SubagentTranscript>`.  Functions: `start`,
+  `appendAssistant` (maps Anthropic content → pi shape +
+  accumulates usage), `appendToolResult` (normalizes content),
+  `recordProgress` (summary + lastToolName + subagentType
+  backfill), `markFinished` (status + summary), `take` / `peek` /
+  `clear` / `size`.  Idempotent `ensure()` for late-arriving
+  appends.
+- **`src/event-bridge.ts`**: replaced the "drop subagent events"
+  early-return with structured CAPTURE.  Typed `assistant` →
+  `transcriptAppendAssistant`.  Typed `user(tool_result)` →
+  `transcriptAppendToolResult`.  `system.task_started` →
+  `transcriptStart`.  `system.task_progress` →
+  `transcriptRecordProgress`.  `system.task_notification` →
+  `transcriptMarkFinished`.  `system.task_updated` and
+  `tool_progress` still dropped (no useful UI consumption).
+- **`src/event-bridge.ts ingestToolResult`**: on the main-thread
+  Task tool_result, call `transcriptTake(id)` and attach the
+  transcript to the cache entry's `details` under
+  `_piCasSubagentTranscript`.  Spread vs assign-under-key handled
+  carefully so a string `tool_use_result` (rare error case) isn't
+  splatted into character keys.
+- **`src/task-stub.ts`** (new): hand-tuned `Task` ToolDefinition with
+  `renderCall` (title + dim description preview) and `renderResult`
+  (collapsed: title + last 10 items + usage; expanded: Container
+  with task prompt, tool calls via `formatToolCall`, final Markdown
+  answer, usage stats).  `formatToolCall` exported helper covers
+  Bash/Read/Write/Edit/Grep/Glob/Task with paths shortened to ~ for
+  $HOME; generic JSON preview fallback for unknown tools.  Fallback
+  path when no transcript captured (renders the raw text content
+  with a "(no transcript)" marker).
+- **`src/stub-tools.ts`**: exported `executeStub` so task-stub.ts
+  can delegate to the same cache-lookup logic.
+- **`src/provider.ts`**: registered `createTaskStub()` alongside the
+  named stubs (with `TASK_TOOL_NAME` added to `registeredStubNames`
+  so the catch-all path won't double-register).  Set
+  `forwardSubagentText: true` in SDK options with a docstring
+  explaining the implication.
+- **`src/system-prompt.ts`**: replaced the "no nested rendering"
+  caveat with the new behavior ("the host UI renders the subagent's
+  reasoning, intermediate tool calls, and final answer inline under
+  the parent Task call (collapsed by default, Ctrl+O to expand).
+  Delegate liberally for self-contained sub-tasks…").
+- **`package.json`**: added `@earendil-works/pi-tui` to
+  peerDependencies (needed for `Container` / `Markdown` / `Text` /
+  `Spacer` in task-stub.ts).
+
+Tests:
+- **`tests/subagent-transcript.test.ts`** (new, 15 tests):
+  start/ensure idempotency, appendAssistant content mapping,
+  multi-turn usage accumulation, model first-write-wins,
+  appendToolResult with string/array content + is_error flag,
+  malformed-block defense, recordProgress fields,
+  subagentType-backfill once-only, markFinished, take/peek/clear.
+- **`tests/task-stub.test.ts`** (new, 15 tests): tool definition
+  shape, execute() delegates to executeStub and surfaces transcript
+  in details, cache-miss path, smoke-test renderCall and
+  renderResult (both branches: with/without transcript, collapsed
+  + expanded), `formatToolCall` per-tool string output (Bash, Read
+  w/ offset+limit, Write line count, Edit, Grep `/pattern/ in path`,
+  Glob, nested Task, unknown name fallback, HOME shortening).
+- **`tests/event-bridge.test.ts`**: updated the
+  `parent_tool_use_id` test set to verify CAPTURE (not just
+  dropping):
+  - "subagent events are captured into a transcript and attached to
+    the Task tool_result cache entry": end-to-end main-thread Task
+    + subagent assistant + subagent tool_result + task_notification,
+    asserts transcript shape on the cache entry.
+  - "typed subagent events do not leak into pi's main-segment
+    output": negative test on the main output.
+  - "when there is no subagent transcript, the Task tool_result
+    cache entry has no _piCasSubagentTranscript": fallback safety.
+  - "task_progress updates the transcript (summary, lastToolName)":
+    in-flight UI metadata via `peekTranscript`.
+  - "system task_updated is dropped silently".
+  Helpers updated to pass `tool_use_id` on `task_*` system messages
+  (matches the real SDK shape).
+- **Total: 153/153 pass** (was 120; +15 transcript + 15 task-stub
+  + 3 added/refactored event-bridge tests).
+- `npx tsc --noEmit`: clean.
+
+Docs:
+- `README.md`: "What you get" describes inline transcript rendering.
+  "Known caveats" updated for Phase B shipped + remaining limits.
+- `writeups/write_up.md`: new "Subagent capture + rendering
+  (Phase B)" section replacing the old "Subagent filtering"
+  section.  Known limitations 8 + 9 added for "no live progress" and
+  "no recursive nested expansion".
+- `writeups/subagent_investigation.md`: rewritten Status section
+  ("Phase A AND Phase B SHIPPED").
+- `writeups/continuation_context.md`: replaced the Phase A entry
+  with the Phase A+B description.
+
+---
+
+**Phase 4 — open the tool surface + subagent Phase A (added on
+user request after Phase 3 investigation):**
+
+The investigation document was framed around "we'd need to make these
+changes to enable Phase A".  User asked to ship Phase A immediately.
+
+- `src/provider.ts`: `tools: [...SUPPORTED_CC_TOOL_NAMES]` →
+  `tools: { type: 'preset', preset: 'claude_code' }` in `ensureSession`.
+  The model now has the full CC tool preset.  Long docstring updated.
+- `src/event-bridge.ts handle()`: explicit early-return on
+  - `msg.parent_tool_use_id != null` (any typed event, covers
+    subagent-internal assistant/user/tool_progress).
+  - `msg.type === "system"` + subtype in `{task_started, task_progress,
+    task_updated, task_notification}`.
+  - `msg.type === "tool_progress"` (both main-thread and subagent;
+    we don't surface per-tool progress yet).
+- `src/event-bridge.ts`: added `cleanupLeakedSubagentToolUses(content)`
+  for the defensive case where SDK ever leaks subagent SSE partials.
+  Removes leaked ids from `pendingToolUseIds`, `segmentToolUseIds`,
+  and `output.content`.  No-op in the expected case.
+- `src/system-prompt.ts`: updated to list the full toolset and
+  include a Phase A subagent UX caveat.  ("the host UI shows the
+  parent Task call and its final result, but does NOT yet show the
+  subagent's internal reasoning or tool calls.  Prefer subagents for
+  self-contained sub-tasks…")
+- `tests/event-bridge.test.ts`: 4 new tests covering:
+  - Typed subagent assistant events are dropped (no content leakage).
+  - `system.task_*` messages dropped silently.
+  - `tool_progress` events (both main and subagent) dropped.
+  - Defensive cleanup of leaked subagent tool_uses.
+- README + write_up + continuation_context + subagent_investigation
+  updated to reflect "Phase A SHIPPED" state.
+- `npx tsc --noEmit`: clean.
+- 120/120 tests pass (was 116; +4 subagent-filtering tests).
+
+### Tests
+
+- 17 tests in `tests/stub-tools.test.ts` (was 9): + 8 for
+  `createGenericStub`, `isValidDynamicToolName`.
+- 21 tests in `tests/event-bridge.test.ts` (was 16): + 5 for
+  `onUnknownToolName` callback (fires/doesn't fire, no dedupe, throw
+  safety, backward compat without callback).
+- 9 tests in new `tests/fork-and-compact.test.ts`: cover all
+  `resolveResumeForFreshSession` precedence cases including the
+  documented single-slot-pendingFork limitation, plus
+  `initialLastSentCount` re-pinning for compact-recovery use.
+- Total: 116/116 pass (was 94/94).
+- `npx tsc --noEmit`: clean.
+
+### Writeups updated
+
+- `README.md`: "Known caveats" updated to reflect new fork/compact
+  behavior + catch-all stub.  "Tested / known caveats" bullet added
+  for fork/compact preservation + catch-all.
+- `writeups/write_up.md`: new "Fork & compact handling (v2)" section.
+  New "Catch-all stub for unknown CC tools" section.  "Known
+  limitations" updated (5+6 changed, 7 added for resolved
+  unknown-tool crash; double-fork-without-open documented as
+  sub-limitation).
+- `writeups/continuation_context.md`: "What's currently in-progress /
+  blocked" now lists what shipped + what's still deferred.
+- `writeups/subagent_investigation.md`: new file.
+- `probe-subagent-events.mjs`: new file.
+
+### Not done / deferred for future work
+
+- Probe-validating subagent behavior against the real API.  Document
+  ready, code not yet run.
+- Pi-entry-id ↔ SDK-message-uuid map.  Blocks proper
+  `forkSession({ upToMessageId })` AND subagent-panel scoping.
+- Map-based `pendingFork` (instead of single slot) to handle
+  multi-fork-without-open.  Documented as a known limitation;
+  unlikely to bite in practice.
+- Forwarding pi compact to SDK via `/compact` user-message.  Would
+  keep token usage on the SDK side in sync with pi's view.
+- Phase A subagent support (add Task to SUPPORTED_CC_TOOL_NAMES +
+  bridge filtering for parent_tool_use_id events).  Bigger UX
+  decision; needs probe validation first.
+
+---
+
 ## Initial investigation — Option B blocked by SDK auto-allow 05/19/2026 14:51 - commit c650d22 (before fix)
 
 ### What was done

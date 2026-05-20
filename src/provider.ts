@@ -71,7 +71,12 @@
  *   that: the per-session promptQueue / event consumer is not re-entrant.
  */
 
-import { query, type Options, type Query } from "@anthropic-ai/claude-agent-sdk";
+import {
+  forkSession as sdkForkSession,
+  query,
+  type Options,
+  type Query,
+} from "@anthropic-ai/claude-agent-sdk";
 import {
   getModels,
   createAssistantMessageEventStream,
@@ -91,9 +96,11 @@ import { getAuthStatus, formatAuthBanner, formatAuthDetails } from "./auth.js";
 import { FastModeBadge } from "./badge.js";
 import {
   createStubTools,
-  isSupportedStubTool,
+  createGenericStub,
+  isValidDynamicToolName,
   SUPPORTED_CC_TOOL_NAMES,
 } from "./stub-tools.js";
+import { createTaskStub, TASK_TOOL_NAME } from "./task-stub.js";
 import {
   type ProviderConfig,
   createDefaultConfig,
@@ -166,10 +173,28 @@ interface PiSession {
   /**
    * How many of pi's messages we've already consumed.  Each `streamSimple`
    * call processes `context.messages.slice(lastSentCount)` to extract the
-   * new user input.  Reset to 0 on fork/compact (mapping cleared → next
-   * streamSimple spawns fresh and starts counting over).
+   * new user input.
+   *
+   * - Fork: when pi forks, a fresh `PiSession` is constructed for the new
+   *   branch (different pi session id); the fresh session's
+   *   `initialLastSentCount` handles the count, and the SDK session is
+   *   re-attached via `forkSession()` (see `session_before_fork` handler).
+   * - Compact: pi compacts its message list in place.  The next
+   *   `streamSimple` call will have a shorter `messages` array than our
+   *   `lastSentCount` was tracking — without intervention,
+   *   `classifyNewContent` would slice past the end and see "empty".  We
+   *   set {@link needsLastSentReset} in `session_before_compact` so the next
+   *   streamSimple reseats `lastSentCount` to `max(0, messages.length - 1)`
+   *   (same logic as `initialLastSentCount`).
    */
   lastSentCount: number;
+  /**
+   * Set by the `session_before_compact` handler.  Tells the next
+   * `streamSimple` call to re-seat {@link lastSentCount} to N-1 of the
+   * compacted message list before classifying new content.  Cleared after
+   * the reset.
+   */
+  needsLastSentReset?: boolean;
 }
 
 /* ----------------------------- registration ----------------------------- */
@@ -177,6 +202,12 @@ interface PiSession {
 export function registerProvider(pi: ExtensionAPI): void {
   // Module-level config; slash commands mutate this.
   const config: ProviderConfig = createDefaultConfig();
+
+  // Track which stub-tool names we've registered with pi (statically + via
+  // the dynamic catch-all path).  Used by registerDynamicStub to dedupe.
+  // Seeded from SUPPORTED_CC_TOOL_NAMES below after the named stubs are
+  // registered.
+  const registeredStubNames = new Set<string>();
 
   // Optional HTTP log proxy.  Same lifecycle as before: lazy-start, point the
   // subprocess at it via env, forward to whichever upstream we end up using.
@@ -245,24 +276,93 @@ export function registerProvider(pi: ExtensionAPI): void {
   // SDK-cached results.  See `stub-tools.ts` for the full rationale.
   for (const tool of createStubTools()) {
     pi.registerTool(tool);
+    registeredStubNames.add(tool.name);
   }
+  // Pre-register the Task stub with its rich subagent-transcript
+  // renderer (see `src/task-stub.ts`).  Pre-registering — instead of
+  // letting the catch-all path handle it — gives us a hand-tuned
+  // schema (description/prompt/subagent_type are spelled out), a nice
+  // label, and the custom renderResult that shows the captured
+  // subagent transcript.
+  const taskStub = createTaskStub();
+  pi.registerTool(taskStub);
+  registeredStubNames.add(taskStub.name);
   if (DEBUG) {
     console.error(
       `[pi-cas/debug] registered ${SUPPORTED_CC_TOOL_NAMES.length} stub tools: ` +
-        SUPPORTED_CC_TOOL_NAMES.join(", "),
+        SUPPORTED_CC_TOOL_NAMES.join(", ") +
+        `, plus ${TASK_TOOL_NAME} (rich renderer)`,
     );
   }
 
+  // Catch-all stub registration.  Called by the event bridge the first time
+  // the SDK emits a tool_use block whose name isn't in the statically
+  // registered set above (e.g. a skill activation surfaces a new tool, or a
+  // future CC release ships a tool we didn't anticipate).  Without this,
+  // pi's agent loop would crash with `Tool <name> not found` because we
+  // never registered a handler.
+  //
+  // We use pi's mid-session `registerTool` (extension-loader.js:178-185:
+  // sets the tool in the extension's map and calls refreshTools).  The
+  // registration completes synchronously before the bridge closes the
+  // current segment, so pi sees the stub by the time it processes the
+  // `done` event for the assistant message containing the tool_use.
+  //
+  // Names are validated via isValidDynamicToolName (PascalCase /
+  // mcp__server__tool shape) — a defensive belt against malformed names
+  // that could collide with pi's internal conventions or break tool
+  // matching in pi's UI.  If a name fails validation, we log loudly and
+  // skip registration; pi will crash at execute time as it would have
+  // without this feature, but operators will see WHY in stderr.
+  config.registerDynamicStub = (toolName: string): void => {
+    if (registeredStubNames.has(toolName)) return;
+    if (!isValidDynamicToolName(toolName)) {
+      console.warn(
+        `[pi-cas] SDK emitted tool_use with name "${toolName}" that does ` +
+          "not match the expected shape (PascalCase / mcp__server__tool). " +
+          "Pi will crash when it tries to execute this tool.  If this is a " +
+          "legitimate tool name, file a bug — pi-cas's validation needs " +
+          "updating.",
+      );
+      return;
+    }
+    registeredStubNames.add(toolName);
+    try {
+      pi.registerTool(createGenericStub(toolName));
+    } catch (err) {
+      console.error(
+        `[pi-cas] failed to register catch-all stub for "${toolName}": ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      // Remove from the set so a subsequent attempt could retry, in case
+      // the failure was transient.
+      registeredStubNames.delete(toolName);
+      return;
+    }
+    console.warn(
+      `[pi-cas] registered catch-all stub for SDK-emitted tool "${toolName}" ` +
+        "(not in SUPPORTED_CC_TOOL_NAMES).  See README \"Known caveats\" " +
+        "for details on the restricted tool surface.",
+    );
+  };
+
   // Register a `tool_result` event handler so the SDK's `is_error` flag
   // on each tool_result propagates to pi's ToolResultMessage.isError.
-  // The stub tool stuffs the flag into `details._piCasIsError`; we read it
-  // here and return an override.  (AgentTool.execute has no `isError`
-  // return field — pi infers isError from whether execute() throws.
-  // Throwing would lose the SDK's structured details, so we use this
-  // post-hoc override instead.)
+  // The stub tool (named or dynamic catch-all) stuffs the flag into
+  // `details._piCasIsError`; we read it here and return an override.
+  // (AgentTool.execute has no `isError` return field — pi infers isError
+  // from whether execute() throws.  Throwing would lose the SDK's
+  // structured details, so we use this post-hoc override instead.)
+  //
+  // We gate on the PRESENCE of `_piCasIsError` (not on whether the tool
+  // name is one of ours) so the path covers both named stubs AND
+  // dynamically-registered catch-all stubs — the latter wouldn't match
+  // `isSupportedStubTool`.  The flag itself is the unique marker that
+  // tells us "this tool_result came from pi-cas".
   pi.on("tool_result", (event) => {
-    if (!isSupportedStubTool(event.toolName)) return undefined;
-    const flag = (event.details as Record<string, unknown> | undefined)?._piCasIsError;
+    const details = event.details as Record<string, unknown> | undefined;
+    const flag = details?._piCasIsError;
     if (typeof flag === "boolean") {
       return { isError: flag };
     }
@@ -308,11 +408,18 @@ function registerLifecycleHooks(pi: ExtensionAPI, config: ProviderConfig): void 
     if (DEBUG) console.error(`[pi-cas/debug] session_shutdown reason=${event.reason}`);
     for (const [piId, session] of config.sessions) {
       await teardownSession(session, `session_shutdown(${event.reason})`);
-      // On a hard shutdown ("quit"), keep the mapping so the next pi launch
-      // can resume.  On reload/new/resume/fork, clear it — those reasons
-      // mean the next pi-cas instance for this id should NOT pick up the
-      // old SDK session.
-      if (event.reason !== "quit") {
+      // Mapping policy:
+      //   - "quit": hard shutdown.  Keep the mapping so the next pi launch
+      //     can resume.
+      //   - "fork": the OLD session is being abandoned for a new one.  Keep
+      //     the mapping for the old pi session id, since the user might
+      //     navigate back to it later.  The fork itself was already wired up
+      //     in `session_before_fork` (forkSession + pendingFork stash); the
+      //     NEW pi session id will pick that up on its first streamSimple.
+      //   - "reload" / "new" / "resume": the pi session is being replaced
+      //     wholesale.  Clear the mapping so the next pi-cas session for
+      //     this id starts fresh.
+      if (event.reason !== "quit" && event.reason !== "fork") {
         clearSessionMapping(piId);
       }
     }
@@ -320,14 +427,76 @@ function registerLifecycleHooks(pi: ExtensionAPI, config: ProviderConfig): void 
   });
 
   pi.on("session_before_fork", async (event) => {
-    if (DEBUG) console.error(`[pi-cas/debug] session_before_fork entry=${event.entryId} position=${event.position}`);
-    // V1: tear down + clear mapping.  Next streamSimple after the fork will
-    // spawn a fresh query with no SDK-side history (i.e. the model loses
-    // context).  This is the documented v1 limitation; v2 should use the
-    // SDK's forkSession + resumeSessionAt to preserve history.
+    if (DEBUG) {
+      console.error(
+        `[pi-cas/debug] session_before_fork entry=${event.entryId} position=${event.position}`,
+      );
+    }
+    // Goal: preserve the model's prior history on the forked branch.
+    //
+    // Strategy (v2 — was: tear down + lose history):
+    //   1. For each active session with an established SDK session id, call
+    //      the SDK's `forkSession()` to create a NEW SDK session that's a
+    //      copy of the current one.  This produces a fresh sessionId we can
+    //      later resume into.
+    //   2. Stash that forked sessionId in `config.pendingFork`.  The next
+    //      `streamSimple` for a new pi session id (the forked branch) will
+    //      see the pending fork, resume into the forked SDK session, and
+    //      clear the stash.
+    //   3. Tear down the current SDK query — pi is shutting this session
+    //      down to construct the fork.  Don't clear the original mapping
+    //      (the user may navigate back to the source branch).
+    //
+    // **Tradeoff (documented in README "Known caveats"):** we currently
+    // copy the FULL SDK session, not "up to the fork entry id" — there's no
+    // pi-entry-id → SDK-message-uuid map yet (write_up.md "Open paths").
+    // So the model on the forked branch may have slightly more context
+    // than pi's truncated branch UI shows.  This is generally benign (more
+    // context = better answer) but can surprise the user.  Future work:
+    // bookkeeping + `forkSession({ upToMessageId })`.
+    //
+    // Failure mode: if `forkSession()` throws (e.g. SDK transcript not yet
+    // on disk, session id missing), we fall back to the v1 behavior — tear
+    // down + clear mapping — and the forked branch starts with no model
+    // history.  Logged as a warning visible without DEBUG so operators
+    // notice.
     for (const [piId, session] of config.sessions) {
+      const sdkId = session.sdkSessionId;
+      if (sdkId) {
+        try {
+          const result = await sdkForkSession(sdkId);
+          config.pendingFork = {
+            sourcePiSessionId: piId,
+            forkedSdkSessionId: result.sessionId,
+          };
+          if (DEBUG) {
+            console.error(
+              `[pi-cas/debug] forkSession(${sdkId}) → ${result.sessionId}; ` +
+                `pendingFork stashed for next streamSimple`,
+            );
+          }
+        } catch (err) {
+          console.warn(
+            `[pi-cas] forkSession(${sdkId}) failed: ${
+              err instanceof Error ? err.message : String(err)
+            }.  Forked branch will start without model history.`,
+          );
+          // Fall back to v1 behavior for this session: clear the mapping so
+          // the new pi session spawns fresh, no resume.
+          clearSessionMapping(piId);
+        }
+      } else {
+        if (DEBUG) {
+          console.error(
+            `[pi-cas/debug] session_before_fork: no sdkSessionId for ${piId}; ` +
+              `nothing to fork (forked branch will start fresh)`,
+          );
+        }
+        // No SDK session ever materialized; nothing to fork.  Clear any
+        // stale mapping that might exist on disk for this id.
+        clearSessionMapping(piId);
+      }
       await teardownSession(session, "session_before_fork");
-      clearSessionMapping(piId);
     }
     config.sessions.clear();
     // Don't cancel the fork — return without a result/decision means "proceed".
@@ -335,14 +504,30 @@ function registerLifecycleHooks(pi: ExtensionAPI, config: ProviderConfig): void 
 
   pi.on("session_before_compact", async () => {
     if (DEBUG) console.error(`[pi-cas/debug] session_before_compact`);
-    // Same handling as fork: tear down the SDK session.  Pi will replace
-    // its history with the compaction summary and the next streamSimple
-    // will spawn fresh.
-    for (const [piId, session] of config.sessions) {
-      await teardownSession(session, "session_before_compact");
-      clearSessionMapping(piId);
+    // Strategy: DON'T tear down.  Pi compacts its own visible transcript;
+    // the SDK keeps its full internal history.  The next user prompt is
+    // sent to the SDK as a normal user message, and the SDK responds with
+    // full prior context.
+    //
+    // We DO need to fix up `lastSentCount`: after compact, pi's
+    // `context.messages` is much shorter (replaced with a summary entry +
+    // recent tail).  Our stale `lastSentCount` would slice past the end
+    // and report `kind: "empty"`, causing pi to see an empty assistant
+    // message.  Set the `needsLastSentReset` flag so the next streamSimple
+    // reseats `lastSentCount` to N-1 (treat like a fresh resume).
+    //
+    // **Tradeoff (documented in README "Known caveats"):** the SDK keeps
+    // its full uncompacted history.  Pi's UI shows the compacted summary,
+    // but the model uses the full transcript.  This is mostly a feature
+    // (better answers), but it does mean compaction doesn't shrink token
+    // usage on the SDK side.  If a session approaches the SDK's own
+    // context limit, the SDK has its OWN auto-compaction (controlled by
+    // `autoCompactThreshold` in CC's settings).  Future work: forward
+    // pi's compact event to the SDK via `/compact` user-message slash
+    // command so the two views stay in sync.
+    for (const session of config.sessions.values()) {
+      session.needsLastSentReset = true;
     }
-    config.sessions.clear();
   });
 }
 
@@ -437,7 +622,25 @@ function streamViaSDK(
       );
     }
 
-    // 3. Classify the new pi-side content since lastSentCount.
+    // 3. Compact-recovery: if pi compacted its history while this session
+    // was alive (`session_before_compact` fired), our `lastSentCount` is
+    // stale relative to the new (shorter) message list.  Re-seat to N-1
+    // (same logic as `initialLastSentCount` for a fresh resume) so we send
+    // only the trailing user message and the SDK supplies the model's full
+    // pre-compact context internally.
+    if (session.needsLastSentReset) {
+      const before = session.lastSentCount;
+      session.lastSentCount = initialLastSentCount(context.messages.length);
+      session.needsLastSentReset = false;
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] post-compact lastSentCount reset: ${before} → ` +
+            `${session.lastSentCount} (messages.length=${context.messages.length})`,
+        );
+      }
+    }
+
+    // 4. Classify the new pi-side content since lastSentCount.
     const classification = classifyNewContent(
       context.messages,
       session.lastSentCount,
@@ -686,9 +889,24 @@ async function ensureSession(
     }
   }
 
-  // Spawn fresh.  If we have a persisted SDK session id, resume into it so
-  // the SDK can replay its own (clean, properly-paired) JSONL.
-  const resumeId = getSessionMapping(piSessionId);
+  // Determine the SDK session id to resume into, if any.  See
+  // {@link resolveResumeForFreshSession} for the precedence rules.
+  const resolved = resolveResumeForFreshSession(
+    piSessionId,
+    config.pendingFork,
+    getSessionMapping(piSessionId),
+  );
+  const resumeId = resolved.resumeId;
+  if (resolved.consumePendingFork && resumeId) {
+    setSessionMapping(piSessionId, resumeId);
+    config.pendingFork = undefined;
+    if (DEBUG) {
+      console.error(
+        `[pi-cas/debug] claimed pendingFork: forkedSdkSessionId=${resumeId} → ` +
+          `new pi=${piSessionId} (mapping persisted)`,
+      );
+    }
+  }
   if (DEBUG) {
     console.error(
       `[pi-cas/debug] spawning query: pi=${piSessionId} cwd=${cwd} resume=${resumeId ?? "(none)"}`,
@@ -780,13 +998,36 @@ async function ensureSession(
     settingSources: [],
     permissionMode: config.permissionMode,
     includePartialMessages: true,
+    // Forward subagent text/thinking blocks as assistant/user typed
+    // messages with `parent_tool_use_id` set.  Without this, only
+    // subagent tool_use/tool_result blocks are emitted (a "heartbeat
+    // counter" per SDK docs).  We want the full subagent transcript so
+    // the Task stub's renderer can show the subagent's reasoning,
+    // intermediate tool calls, and final answer — see
+    // `src/task-stub.ts` renderResult.
+    forwardSubagentText: true,
     cwd,
     env,
-    // Restrict the model's tool surface to exactly the CC built-ins we have
-    // pi stubs for (see stub-tools.ts).  If the model emits a tool_use whose
-    // name isn't in this list, pi's agent loop will fail with `Tool <name>
-    // not found` because we wouldn't have a stub registered.
-    tools: [...SUPPORTED_CC_TOOL_NAMES],
+    // Expose the full Claude Code built-in tool preset to the model
+    // (Bash, Read, Write, Edit, Grep, Glob, Task / subagents, WebFetch,
+    // WebSearch, NotebookEdit, TodoWrite, ExitPlanMode, MCP tools, etc.).
+    //
+    // Originally we restricted this to `[...SUPPORTED_CC_TOOL_NAMES]` (the
+    // six built-ins with named stubs) to guarantee pi's agent loop could
+    // execute every tool the model emitted.  Now that the bridge has a
+    // catch-all stub registration path (see
+    // `EventBridgeOptions.onUnknownToolName` + provider's
+    // `registerDynamicStub`), pi survives any tool name the SDK surfaces
+    // — the catch-all stub just looks up the cached result like the named
+    // stubs do.
+    //
+    // Subagent inner conversation events (`parent_tool_use_id != null`)
+    // are filtered out in the bridge (see handle() in event-bridge.ts), so
+    // pi sees only the parent `Task` tool_use + its final tool_result.
+    // The subagent's internal tool calls / text / progress are not
+    // surfaced — see writeups/subagent_investigation.md "Phase B" for the
+    // path to nested-transcript rendering.
+    tools: { type: "preset", preset: "claude_code" },
     ...(resumeId ? { resume: resumeId } : {}),
     ...(fastFrag.extraArgs ? { extraArgs: fastFrag.extraArgs } : {}),
     effort: mapEffort(options?.reasoning),
@@ -807,7 +1048,9 @@ async function ensureSession(
     sdkSessionId: undefined,
     query: q,
     iter,
-    bridge: createEventBridge(model),
+    bridge: createEventBridge(model, {
+      onUnknownToolName: (name) => config.registerDynamicStub?.(name),
+    }),
     recentlyEmittedToolUseIds: new Set(),
     promptQueue,
     genWaker: null,
@@ -904,6 +1147,44 @@ function buildSubprocessEnv(
  */
 export function initialLastSentCount(piMessagesLength: number): number {
   return Math.max(0, piMessagesLength - 1);
+}
+
+/**
+ * Decide which SDK session id (if any) a freshly-spawning `PiSession` should
+ * resume into.
+ *
+ * Precedence (highest to lowest):
+ *   1. **Pending fork.**  If `session_before_fork` ran for some OTHER pi
+ *      session id and stashed a forked SDK session id in `config.pendingFork`,
+ *      and we are spawning for a DIFFERENT pi session id (the new forked
+ *      branch), claim that forked SDK session id.  This preserves model
+ *      history across the fork.
+ *   2. **Persisted resume id.**  If we have a previously-recorded SDK session
+ *      id for this exact pi session id (e.g. from a prior pi process — cross-
+ *      process resume), use that.
+ *   3. **None.**  Spawn a fresh SDK session.
+ *
+ * The pending-fork entry is consumed only when the source pi session id
+ * differs from the spawn-target (the SAME pi session id reopening shouldn't
+ * eat its own fork stash — that would happen if pi reused the source id for
+ * the new branch, which it doesn't, but defensively we guard).
+ *
+ * `consumePendingFork` is true iff (1) applied; the caller is responsible for
+ * persisting the new mapping and clearing `config.pendingFork`.
+ *
+ * Exported for unit testing.
+ */
+export function resolveResumeForFreshSession(
+  piSessionId: string,
+  pendingFork:
+    | { sourcePiSessionId: string; forkedSdkSessionId: string }
+    | undefined,
+  persistedResumeId: string | undefined,
+): { resumeId: string | undefined; consumePendingFork: boolean } {
+  if (pendingFork && pendingFork.sourcePiSessionId !== piSessionId) {
+    return { resumeId: pendingFork.forkedSdkSessionId, consumePendingFork: true };
+  }
+  return { resumeId: persistedResumeId, consumePendingFork: false };
 }
 
 /* ----------------------------- message classification ----------------------------- */

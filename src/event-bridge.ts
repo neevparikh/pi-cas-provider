@@ -56,6 +56,14 @@ import { calculateCost } from "@earendil-works/pi-ai";
 import { PROVIDER_ID } from "./config.js";
 import { put as cacheToolResult, type CachedToolResult } from "./tool-result-cache.js";
 import { isSupportedStubTool } from "./stub-tools.js";
+import {
+  appendAssistant as transcriptAppendAssistant,
+  appendToolResult as transcriptAppendToolResult,
+  markFinished as transcriptMarkFinished,
+  recordProgress as transcriptRecordProgress,
+  start as transcriptStart,
+  take as transcriptTake,
+} from "./subagent-transcript.js";
 
 const DEBUG = process.env.PI_CAS_DEBUG === "1";
 
@@ -148,7 +156,36 @@ export interface EventBridge {
   getCost(): number | undefined;
 }
 
-export function createEventBridge(initialModel: Model<any>): EventBridge {
+/**
+ * Per-bridge options.  All optional.
+ */
+export interface EventBridgeOptions {
+  /**
+   * Called the FIRST time the bridge observes a `tool_use` block whose name
+   * isn't in {@link SUPPORTED_CC_TOOL_NAMES}.
+   *
+   * The provider uses this to register a catch-all stub via
+   * `pi.registerTool` before pi's agent loop tries to execute the unknown
+   * tool (which would otherwise crash with `Tool <name> not found`).  The
+   * bridge fires this callback at `content_block_start` time — well before
+   * the segment closes — so pi sees the stub by the time it processes the
+   * `done` event.
+   *
+   * The callback should be idempotent (the bridge does NOT dedupe across
+   * invocations within or across sessions).  The provider is expected to
+   * track a "registered" set itself.
+   *
+   * The callback should not throw; the bridge does not handle errors here
+   * and a throw would abort the entire SDK message processing for the
+   * segment.
+   */
+  onUnknownToolName?: (toolName: string) => void;
+}
+
+export function createEventBridge(
+  initialModel: Model<any>,
+  options: EventBridgeOptions = {},
+): EventBridge {
   // Current model for this segment.  Updated on `attachStream` so a
   // mid-session model switch is reflected in both the recorded
   // `output.model` and `calculateCost()` per-token rates.
@@ -194,6 +231,141 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
     // sdk_session_id (only on the very first init of the long-lived query).
     if (msg.type === "system" && msg.subtype === "init") {
       sdkSessionId = msg.session_id ?? sdkSessionId;
+      return;
+    }
+
+    // **Subagent handling — typed-message path.**
+    //
+    // When a Task (subagent) is in flight, the SDK emits the subagent's
+    // assistant/user/tool_progress messages on the same iterator as the
+    // main thread, tagged with `parent_tool_use_id != null`.  We must
+    // keep these OUT of pi's view of the main-thread segment (they'd
+    // appear as extra tool_call blocks pi tries to execute, and their
+    // nested tool_results would corrupt our pendingToolUseIds pairing).
+    //
+    // BUT we don't just drop them — we capture them into a per-Task-id
+    // `SubagentTranscript` (see `src/subagent-transcript.ts`).  When the
+    // parent Task tool_result eventually arrives (parent_tool_use_id=null),
+    // the bridge attaches the collected transcript to the cache entry's
+    // `details` under `_piCasSubagentTranscript`.  Pi's Task stub
+    // (`src/task-stub.ts`) reads this in its `renderResult` and renders
+    // the nested transcript (reasoning, tool calls, final output) the
+    // same way pi-subagent's renderer does.
+    //
+    // This relies on the SDK forwarding subagent text/thinking — which
+    // requires `forwardSubagentText: true` in SDK options.  Without it,
+    // only subagent tool_use/tool_result blocks are forwarded, and the
+    // rendered transcript only shows the tool calls.  See provider.ts
+    // ensureSession() where the option is set.
+    if (msg.parent_tool_use_id != null) {
+      const parentId = String(msg.parent_tool_use_id);
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] capturing subagent event: type=${msg.type} ` +
+            `parent_tool_use_id=${parentId.slice(-8)} ` +
+            (msg.subagent_type ? `subagent_type=${msg.subagent_type} ` : ""),
+        );
+      }
+      // Defensive recovery: if the SDK leaked subagent tool_use blocks
+      // into the main segment via SSE partials (we couldn't tell at that
+      // point — SSE wraps the inner BetaMessage which doesn't carry
+      // parent_tool_use_id), now that we have the typed assistant message
+      // confirming "those were subagent tool_uses", remove them from
+      // pendingToolUseIds so the main segment can still close.
+      if (msg.type === "assistant") {
+        const content = msg.message?.content;
+        if (Array.isArray(content)) {
+          cleanupLeakedSubagentToolUses(content);
+          transcriptAppendAssistant(
+            parentId,
+            content,
+            msg.message?.usage,
+            msg.message?.model,
+            msg.message?.stop_reason,
+          );
+        }
+      } else if (msg.type === "user") {
+        const content = msg.message?.content;
+        if (Array.isArray(content)) {
+          let first = true;
+          for (const block of content) {
+            if (block?.type === "tool_result") {
+              transcriptAppendToolResult(
+                parentId,
+                block,
+                first ? msg.tool_use_result : undefined,
+              );
+              first = false;
+            }
+          }
+        }
+      }
+      // tool_progress messages tagged with parent_tool_use_id: don't
+      // append to transcript (already encapsulated in tool_use_result
+      // when ingested above) — just drop.
+      return;
+    }
+
+    // Task lifecycle / progress system messages.  We use these to populate
+    // subagent transcript metadata (subagent_type, task description,
+    // running summary, final status) so the Task stub's renderResult can
+    // display the same kind of UI pi-subagent shows for its delegated
+    // agents.  They are NOT surfaced to pi's main message stream.
+    if (msg.type === "system" && typeof msg.subtype === "string") {
+      const sub = msg.subtype as string;
+      const toolUseId: string | undefined =
+        typeof msg.tool_use_id === "string" ? msg.tool_use_id : undefined;
+      if (sub === "task_started" && toolUseId) {
+        transcriptStart(toolUseId, {
+          subagentType: typeof msg.subagent_type === "string" ? msg.subagent_type : undefined,
+          taskPrompt: typeof msg.prompt === "string" ? msg.prompt : undefined,
+          description: typeof msg.description === "string" ? msg.description : undefined,
+          taskId: typeof msg.task_id === "string" ? msg.task_id : undefined,
+        });
+        if (DEBUG) {
+          console.error(
+            `[pi-cas/debug] task_started tu=${toolUseId.slice(-8)} ` +
+              `subagent_type=${msg.subagent_type ?? "?"}`,
+          );
+        }
+        return;
+      }
+      if (sub === "task_progress" && toolUseId) {
+        transcriptRecordProgress(toolUseId, {
+          summary: typeof msg.summary === "string" ? msg.summary : undefined,
+          lastToolName: typeof msg.last_tool_name === "string" ? msg.last_tool_name : undefined,
+          subagentType:
+            typeof msg.subagent_type === "string" ? msg.subagent_type : undefined,
+        });
+        return;
+      }
+      if (sub === "task_notification" && toolUseId) {
+        const status = msg.status;
+        if (status === "completed" || status === "failed" || status === "stopped") {
+          transcriptMarkFinished(toolUseId, {
+            status,
+            summary: typeof msg.summary === "string" ? msg.summary : undefined,
+          });
+        }
+        return;
+      }
+      if (sub === "task_updated") {
+        // Status patches; we already track the final status via
+        // task_notification.  Drop with debug log.
+        if (DEBUG) {
+          console.error(
+            `[pi-cas/debug] task_updated task_id=${String(msg.task_id ?? "?").slice(-8)}`,
+          );
+        }
+        return;
+      }
+    }
+
+    // `tool_progress` system events fire periodically for in-flight tools
+    // (including main-thread tools).  We don't currently surface them.
+    // The main-thread case (`parent_tool_use_id === null`) passes through
+    // the earlier filter — explicitly drop here.
+    if (msg.type === "tool_progress") {
       return;
     }
 
@@ -316,11 +488,27 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
         } else if (cb.type === "tool_use") {
           const piIndex = output.content.length;
           if (!isSupportedStubTool(cb.name)) {
+            // Notify the provider so it can register a catch-all stub before
+            // pi's loop tries to execute this tool.  See EventBridgeOptions
+            // docstring.  Bridge does no deduping; provider is responsible.
+            if (options.onUnknownToolName) {
+              try {
+                options.onUnknownToolName(cb.name);
+              } catch (err) {
+                // Defensive: a throw here would corrupt the segment, so log
+                // and continue.  pi may still crash at execute time, but
+                // logging gives operators a fighting chance to diagnose.
+                console.error(
+                  `[pi-cas] onUnknownToolName callback threw for "${cb.name}": ${
+                    err instanceof Error ? err.message : String(err)
+                  }`,
+                );
+              }
+            }
             if (DEBUG) {
               console.error(
-                `[pi-cas/debug] WARN: SDK emitted unsupported tool_use name "${cb.name}". ` +
-                  `Pi will fail to execute (Tool ${cb.name} not found). ` +
-                  `Add it to SUPPORTED_CC_TOOL_NAMES if it should be supported.`,
+                `[pi-cas/debug] SDK emitted unsupported tool_use name "${cb.name}". ` +
+                  `Falling back to dynamic catch-all stub.`,
               );
             }
           }
@@ -439,6 +627,66 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
     }
   }
 
+  /**
+   * Defensive recovery for the case where the SDK emitted subagent SSE
+   * `stream_event` partials that we couldn't filter at the time (the
+   * stream-event wrapper doesn't carry `parent_tool_use_id`).  When the
+   * subsequent typed `assistant` event arrives and tells us those blocks
+   * were subagent-internal, walk its tool_use ids and:
+   *
+   *  1. Remove them from `pendingToolUseIds` (otherwise the segment never
+   *     closes — we'll never get a matching parent=null tool_result for a
+   *     subagent-internal tool).
+   *  2. Remove them from `segmentToolUseIds` (so they don't show up in the
+   *     "phantom-detection" set for the next streamSimple).
+   *  3. Remove the corresponding `output.content` entries so pi doesn't
+   *     see ghost tool_call blocks.
+   *
+   * If the SDK never leaks subagent partials (the expected case with
+   * `forwardSubagentText: false` / unset), this function is a no-op
+   * because none of the listed ids will be in our tracking maps.
+   */
+  function cleanupLeakedSubagentToolUses(subagentContent: any[]): void {
+    const subagentIds = new Set<string>();
+    for (const b of subagentContent) {
+      if (b?.type === "tool_use" && typeof b.id === "string") {
+        subagentIds.add(b.id);
+      }
+    }
+    if (subagentIds.size === 0) return;
+    let cleaned = 0;
+    for (const id of subagentIds) {
+      if (pendingToolUseIds.delete(id)) cleaned++;
+    }
+    segmentToolUseIds = segmentToolUseIds.filter((id) => !subagentIds.has(id));
+    // Walk blocks/output and drop matching tool_use entries.  Index in
+    // output.content is `piIndex`; remove from both blocks[] tracking
+    // and output.content.  Iterate in reverse so splices don't disturb
+    // earlier indices.
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const tracked = blocks[i];
+      if (
+        tracked.kind === "tool_use" &&
+        subagentIds.has((output.content[tracked.piIndex] as ToolCall).id)
+      ) {
+        const piIndex = tracked.piIndex;
+        output.content.splice(piIndex, 1);
+        blocks.splice(i, 1);
+        // Shift remaining piIndex references that pointed AFTER the
+        // removed slot.
+        for (const other of blocks) {
+          if (other.piIndex > piIndex) other.piIndex -= 1;
+        }
+      }
+    }
+    if (cleaned > 0 && DEBUG) {
+      console.error(
+        `[pi-cas/debug] cleaned up ${cleaned} leaked subagent tool_use(s) ` +
+          `from pending set: ${[...subagentIds].map((id) => id.slice(-8)).join(",")}`,
+      );
+    }
+  }
+
   function ingestToolResult(block: any, sdkToolUseResult: unknown): void {
     const id: string = block.tool_use_id;
     if (!id) return;
@@ -448,11 +696,50 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
     // tracked blocks in the current segment.
     const tracked = blocks.find((b) => b.kind === "tool_use" && id === (output.content[b.piIndex] as ToolCall).id);
     const toolName = tracked?.toolName ?? "Unknown";
+
+    // If this tool_result is for a Task tool that ran a subagent, attach
+    // the collected subagent transcript to the cache entry's `details`
+    // (under `_piCasSubagentTranscript`).  The Task stub's renderResult
+    // reads it and renders the nested transcript.  Take semantics free
+    // the in-memory entry so it doesn't accumulate across long sessions.
+    const subagentTranscript = transcriptTake(id);
+    let details: unknown = sdkToolUseResult;
+    if (subagentTranscript) {
+      // Merge: preserve SDK's `tool_use_result` shape (object | string |
+      // undefined) under a sibling key when it's not plain-object-shaped,
+      // or splat it when it is.  The Task stub looks up
+      // `_piCasSubagentTranscript` regardless of the surrounding shape.
+      const sdkIsPlainObject =
+        sdkToolUseResult !== null &&
+        typeof sdkToolUseResult === "object" &&
+        !Array.isArray(sdkToolUseResult);
+      if (sdkIsPlainObject) {
+        details = {
+          ...(sdkToolUseResult as Record<string, unknown>),
+          _piCasSubagentTranscript: subagentTranscript,
+        };
+      } else {
+        details = {
+          _piCasSubagentTranscript: subagentTranscript,
+          ...(sdkToolUseResult !== undefined
+            ? { _piCasToolUseResult: sdkToolUseResult }
+            : {}),
+        };
+      }
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] attached subagent transcript to ${toolName} ` +
+            `tool_result (tu=${id.slice(-8)}, ${subagentTranscript.messages.length} msgs, ` +
+            `status=${subagentTranscript.finalStatus ?? "?"})`,
+        );
+      }
+    }
+
     const entry: CachedToolResult = {
       content,
       isError,
       toolName,
-      details: sdkToolUseResult,
+      details,
     };
     cacheToolResult(id, entry);
     pendingToolUseIds.delete(id);
@@ -483,6 +770,21 @@ export function createEventBridge(initialModel: Model<any>): EventBridge {
         thinkingSignature: b.signature ?? "",
       } as ThinkingContent);
     } else if (b.type === "tool_use") {
+      // Mirror the partial-event path: notify the provider so it can
+      // register a catch-all stub for unknown names before pi tries to
+      // execute the tool.  This branch is the diagnostic fallback for
+      // SDK messages that arrived without streaming partials.
+      if (!isSupportedStubTool(b.name) && options.onUnknownToolName) {
+        try {
+          options.onUnknownToolName(b.name);
+        } catch (err) {
+          console.error(
+            `[pi-cas] onUnknownToolName callback threw for "${b.name}": ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
       output.content.push({
         type: "toolCall",
         id: b.id,

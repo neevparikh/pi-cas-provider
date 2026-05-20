@@ -91,11 +91,60 @@ node probe-stub-tools-edge.mjs
 Nothing in-progress.  Open paths are documented in `write_up.md` under
 "Open paths".
 
-Deferred hardening from the review pass:
+### Recently shipped (commit: pending — full toolset + subagent Phase A + fork/compact + catch-all)
+
+- **Catch-all stub for unknown CC tools.**  `src/stub-tools.ts`
+  `createGenericStub(name)` + `isValidDynamicToolName(name)`.
+  `src/event-bridge.ts` `createEventBridge(model, {onUnknownToolName})`
+  callback.  Provider wires the callback to `pi.registerTool` of a
+  dynamic stub.  Pi no longer crashes when the SDK emits an
+  unrecognized tool_use.
+- **Full Claude Code tool preset enabled.**  Switched
+  `tools: [...SUPPORTED_CC_TOOL_NAMES]` → `tools: { type: 'preset',
+  preset: 'claude_code' }`.  Model now has Task (subagents), WebFetch,
+  WebSearch, NotebookEdit, TodoWrite, ExitPlanMode, MCP tools, etc.
+  All routed through the catch-all stub path.
+- **Subagent Phase A + B: capture inner events + render nested
+  transcripts.**  Typed messages with `parent_tool_use_id != null`
+  and `system.task_*` events are captured into per-Task
+  `SubagentTranscript` (see `src/subagent-transcript.ts`).  The
+  bridge attaches the transcript to the Task tool_result's cache
+  entry; a custom `Task` stub (`src/task-stub.ts`) renders the
+  nested view (text/thinking, tool calls with `formatToolCall`,
+  final Markdown answer, usage stats) — modeled on the
+  [pi-subagent](https://github.com/mariozechner/pi-subagent)
+  extension.  SDK option `forwardSubagentText: true` enabled so
+  subagent text arrives as typed events.  Defensive
+  `cleanupLeakedSubagentToolUses` covers the hypothetical case
+  of leaked SSE partials.
+- **Fork preserves model history.**  `session_before_fork` calls SDK
+  `forkSession()`, stashes the forked session id in
+  `config.pendingFork`.  Next streamSimple on the new pi session id
+  resumes into the forked SDK session via
+  `resolveResumeForFreshSession`.  Limitation: full source session
+  copied (no `upToMessageId` yet).
+- **Compact keeps SDK alive.**  `session_before_compact` flags every
+  active session with `needsLastSentReset` instead of tearing down.
+  Next streamSimple reseats `lastSentCount` to N-1.  The SDK keeps
+  its full internal history; pi's view is the compacted summary.
+
+### Still deferred
+
 - **H4 (abort/signal unit tests)**: requires mocking the Agent SDK's
   `query()`.  E2E probes don't cover in-flight abort.  Defer as a
   separate task.
-- **Catch-all stub for unknown CC tool names** (Open path #4 in
-  write_up.md): would prevent `Tool <name> not found` crashes if a
-  future CC release surfaces a tool we haven't added to
-  `SUPPORTED_CC_TOOL_NAMES`.
+- **Live in-flight subagent progress.**  The rendered transcript
+  currently appears only after the subagent completes (pi-cas holds
+  the bridging segment open until the parent tool_result arrives).
+  Showing live progress mid-flight would require emitting partial pi
+  events during the SDK's subagent run.
+- **Recursive nested-subagent expansion.**  Inner Task within a
+  subagent is shown as a tool call but its own transcript isn't
+  recursively expanded under it.
+- **Probe-validation of subagent flow.**  `probe-subagent-events.mjs`
+  ready; needs run against the real API.
+- **Pi entry-id ↔ SDK message-uuid map**: blocks both
+  `forkSession({ upToMessageId })` and any future subagent-panel
+  scoping work.
+- **Forward pi compact to SDK** via `/compact` user-message slash
+  command so the two views stay in sync.

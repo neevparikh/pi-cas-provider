@@ -26,14 +26,14 @@
  */
 
 export const PROVIDER_SHIM_NOTES = `<pi-environment-note>
-In this environment your tools come from Claude Code: \`Bash\`, \`Read\`, \`Write\`,
-\`Edit\`, \`Grep\`, \`Glob\`.  Use them as you normally would.
+In this environment your tools come from Claude Code (full \`claude_code\`
+preset): \`Bash\`, \`Read\`, \`Write\`, \`Edit\`, \`Grep\`, \`Glob\`, \`Task\`
+(subagents), \`WebFetch\`, \`WebSearch\`, \`NotebookEdit\`, \`TodoWrite\`, and
+any MCP tools the environment exposes.  Use them as you normally would.
 
 If pi's instructions above mention tools using lowercase names like \`bash\`,
 \`read\`, \`edit\`, \`write\`, \`grep\`, \`find\`, those refer to the same underlying
-operations \u2014 just call the PascalCase Claude Code tools instead.  No other
-Claude Code tools are available in this environment (no \`WebFetch\`, \`Agent\`,
-\`NotebookEdit\`, etc.).
+operations \u2014 just call the PascalCase Claude Code tools instead.
 </pi-environment-note>`;
 
 /**

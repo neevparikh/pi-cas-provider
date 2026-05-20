@@ -59,6 +59,18 @@ export const SUPPORTED_CC_TOOL_NAMES = [
 ] as const;
 export type SupportedCcToolName = (typeof SUPPORTED_CC_TOOL_NAMES)[number];
 
+/**
+ * Regex guarding which model-emitted tool names we will accept for dynamic
+ * stub registration via {@link createGenericStub}.  This is a *safety belt*,
+ * not a security boundary — the SDK already validates tool names against its
+ * own registry before emitting `tool_use` blocks.  But pi's `registerTool`
+ * happily accepts any string as a name, and bad names (with whitespace,
+ * slashes, etc.) could collide with internal pi conventions or break tool
+ * matching in pi's UI.  CC tool names are PascalCase identifiers with
+ * underscores in MCP tools (e.g. `mcp__server__tool`); we accept that shape.
+ */
+const VALID_DYNAMIC_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_]*$/;
+
 /* ----------------------------- shared helpers ----------------------------- */
 
 /**
@@ -70,8 +82,8 @@ export type SupportedCcToolName = (typeof SUPPORTED_CC_TOOL_NAMES)[number];
  * probes) always arrives BEFORE we push the segment's `done` to pi.  So
  * the cache miss path is defensive only.
  */
-async function executeStub(
-  toolName: SupportedCcToolName,
+export async function executeStub(
+  toolName: string,
   toolCallId: string,
 ): Promise<{
   content: any[];
@@ -298,4 +310,68 @@ export function createStubTools(): ToolDefinition[] {
  */
 export function isSupportedStubTool(name: string): name is SupportedCcToolName {
   return (SUPPORTED_CC_TOOL_NAMES as readonly string[]).includes(name);
+}
+
+/**
+ * Validate that `name` is shaped like a CC built-in or MCP tool name and is
+ * safe to register dynamically.  See {@link VALID_DYNAMIC_TOOL_NAME}.
+ */
+export function isValidDynamicToolName(name: string): boolean {
+  if (typeof name !== "string" || name.length === 0 || name.length > 128) return false;
+  return VALID_DYNAMIC_TOOL_NAME.test(name);
+}
+
+/**
+ * Build a generic catch-all stub for a tool name we didn't anticipate.
+ *
+ * Used by {@link createEventBridge} via its `onUnknownToolName` callback:
+ * when the SDK emits a `tool_use` block whose name isn't in
+ * {@link SUPPORTED_CC_TOOL_NAMES}, the provider registers one of these stubs
+ * with pi just-in-time, so pi's agent loop has a tool to execute and won't
+ * crash with `Tool <name> not found`.
+ *
+ * The stub's `execute()` looks up the SDK-cached result by toolCallId just
+ * like the named stubs.  The schema is the loosest possible
+ * (additionalProperties: true on an empty object), since the SDK has already
+ * validated the model's arguments against the real tool's schema.
+ *
+ * **Why dynamic (not statically pre-registered):** we cannot enumerate every
+ * tool a current or future CC release might surface — skills can activate
+ * tools, MCP servers contribute tools with arbitrary names, and the CC
+ * built-in surface evolves.  A catch-all keeps pi alive across these
+ * surprises without requiring us to ship a new pi-cas version each time.
+ *
+ * The `tools:` restriction we pass to the SDK in provider.ts already keeps
+ * the model's main toolset narrow.  This catch-all is the safety net for
+ * leaks (skill activations, future CC additions, etc.).
+ */
+export function createGenericStub(name: string): ToolDefinition {
+  if (!isValidDynamicToolName(name)) {
+    // We should never get here — the provider checks before calling — but
+    // throw loudly if we do, since otherwise pi.registerTool would happily
+    // accept a name that may collide with internal conventions.
+    throw new Error(
+      `pi-cas: refusing to create generic stub for invalid tool name: ${JSON.stringify(name)}`,
+    );
+  }
+  return defineTool({
+    name,
+    label: `${name} (claude-code, dynamic stub)`,
+    description:
+      `Catch-all stub for the "${name}" tool, registered by pi-cas at ` +
+      "runtime after the Claude Agent SDK emitted a tool_use block with " +
+      "this name.  The SDK executes the tool natively; pi-cas retrieves " +
+      "the result from a per-session cache.",
+    // The model can't see this stub's schema (only the SDK's view matters),
+    // so we use the loosest possible parameters object.
+    parameters: Type.Object({}, { additionalProperties: true }),
+    // Conservative default: assume tools we don't know about could have
+    // side effects.  Run sequentially so pi doesn't race their cache
+    // lookups against each other or against side-effecting siblings.
+    executionMode: "sequential",
+    prepareArguments: (args) => (args ?? {}) as any,
+    async execute(toolCallId) {
+      return executeStub(name, toolCallId);
+    },
+  });
 }

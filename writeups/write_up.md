@@ -125,12 +125,15 @@ turn.
   call the model would see BOTH that synthetic denial AND our real
   injection of the same `tool_use_id` — API rejects, model confused.
 
-- **Why `tools: [Bash, Read, Write, Edit, Grep, Glob]` and not full CC
-  preset.**  The model can only emit tools we have stubs for.  By
-  restricting the SDK's `tools` to exactly our supported set, we ensure
-  pi's agent loop never encounters an unstubbed tool name (which would
-  fail with `Tool <name> not found`).  Adding more CC tools requires
-  adding both a stub and listing the name in `SUPPORTED_CC_TOOL_NAMES`.
+- **Why `tools: { type: 'preset', preset: 'claude_code' }` (full CC
+  preset).**  Originally we restricted to the six built-ins because pi
+  would crash with `Tool <name> not found` on any tool name not in
+  `SUPPORTED_CC_TOOL_NAMES`.  With the catch-all-stub work, pi survives
+  any tool name the SDK emits (generic stub registered at runtime), so
+  the restriction was lifted to give the model the full CC tool
+  surface (Task / subagents, WebFetch, WebSearch, NotebookEdit,
+  TodoWrite, ExitPlanMode, MCP).  See "Catch-all stub for unknown CC
+  tools" and "Subagent filtering" below.
 
 - **Stubs use loose TypeBox schemas (`additionalProperties: true`).**
   The SDK already validates args against the real CC schemas; the stub
@@ -216,6 +219,150 @@ The bridge captures the error message from `msg.result` / `msg.error`
 on SDK `result` events with `is_error: true`; the provider reads it via
 `bridge.getTurnError()` and `bridge.hasPartialContent()`.
 
+## Fork & compact handling (v2)
+
+(Replaces the v1 "tear down + clear mapping" behavior.)
+
+- **Fork (`session_before_fork`).**  Call the SDK's `forkSession()` on
+  the current session's `sdkSessionId`; stash the returned new session
+  id in `config.pendingFork = {sourcePiSessionId, forkedSdkSessionId}`.
+  Tear down the local SDK query (the new pi session will spawn its own),
+  but DO NOT clear the source pi session's mapping (the user may
+  navigate back).  Next `streamSimple` for a different pi session id
+  consumes the pending fork via `resolveResumeForFreshSession`, uses it
+  as `resume` for the new SDK query, and persists the mapping.
+  - Source-session safety: the source pi session id is unchanged on
+    disk; navigating back resumes into the original SDK session as
+    usual.
+  - Failure mode: if `forkSession()` throws, we log a warning, fall
+    back to the v1 behavior (clear mapping; new branch starts fresh).
+  - Limitation: we copy the full source session, not just up to the
+    pi entry where the fork happened.  Needs pi-entry-id ↔
+    SDK-message-uuid map.  See "Open paths" below.
+
+- **Compact (`session_before_compact`).**  Do NOT tear down.  Set
+  `session.needsLastSentReset = true` on every active session.  Pi
+  compacts its visible transcript; the SDK is undisturbed.  On the
+  next `streamSimple`, the consume path re-seats `lastSentCount =
+  initialLastSentCount(messages.length)` (i.e. N-1) before classifying
+  new content, so we send only the trailing user message.
+  - The SDK has its full pre-compact history internally; the model's
+    next response uses that.
+  - Tradeoff: SDK-side token cost is unchanged by pi's compaction.
+    The SDK has its own auto-compaction (`autoCompactThreshold`).
+  - Open path: forward pi's compact to the SDK via the `/compact`
+    user-message slash command so the two views stay in sync.
+
+## Catch-all stub for unknown CC tools
+
+The SDK now exposes the full `claude_code` tool preset to the model.
+For any tool_use whose name isn't in `SUPPORTED_CC_TOOL_NAMES` (the
+six built-ins with hand-tuned named stubs), the bridge fires
+`onUnknownToolName(name)`.  The provider's callback validates the
+name (PascalCase / `mcp__server__tool` shape, length ≤ 128) and
+calls `pi.registerTool` of a generic stub for that name.  Pi-coding-
+agent's `registerTool` supports mid-session registration
+(loader.js:178-185: `extension.tools.set(name, ...)` +
+`runtime.refreshTools()`); the registration completes synchronously
+before the bridge closes the current segment, so pi sees the stub by
+the time it processes the `done` event for the assistant message
+containing the tool_use.
+
+Result: pi survives the model emitting Task, WebFetch, WebSearch,
+NotebookEdit, TodoWrite, ExitPlanMode, MCP tools, skill-activated
+tools, or anything else a current or future CC release surfaces —
+without per-tool-name updates to pi-cas.
+
+## Subagent capture + rendering (Phase B)
+
+When the model uses the `Task` tool to delegate to a subagent, the
+SDK emits the subagent's inner conversation events on the same
+iterator as the main thread, tagged with `parent_tool_use_id != null`.
+Pi-cas captures these into a `SubagentTranscript` (per-Task
+tool_use_id) and attaches the finished transcript to the parent
+Task tool_result's cache entry, where the Task stub's
+`renderResult` reads it.
+
+### Bridge handling (event-bridge.ts `handle()`)
+
+For events with `parent_tool_use_id != null`:
+
+| Event type | Action |
+|---|---|
+| typed `assistant` | Map content blocks (text / thinking / tool_use) into pi shape via `subagentTranscript.appendAssistant`; accumulate usage; record model.  Also call `cleanupLeakedSubagentToolUses` defensively. |
+| typed `user` with `tool_result` blocks | `subagentTranscript.appendToolResult` per block, with the SDK's `tool_use_result` attached to the first one. |
+| `tool_progress` | Drop (already encapsulated in `tool_use_result`). |
+
+For `system` events:
+
+| Event subtype | Action |
+|---|---|
+| `task_started` (with `tool_use_id`) | `subagentTranscript.start(toolUseId, {subagentType, taskPrompt, description, taskId})` |
+| `task_progress` (with `tool_use_id`) | `subagentTranscript.recordProgress(toolUseId, {summary, lastToolName, subagentType})` |
+| `task_notification` (with `tool_use_id`) | `subagentTranscript.markFinished(toolUseId, {status, summary})` |
+| `task_updated` | Drop (status patches; we get the final status via `task_notification`). |
+
+### Result handover (event-bridge.ts `ingestToolResult`)
+
+When the parent Task tool_result arrives (the one with
+`parent_tool_use_id === null` whose `tool_use_id` matches the parent
+Task block in the main segment), the bridge calls
+`subagentTranscript.take(parentToolUseId)`.  If a transcript is
+present, it's attached to the cache entry's `details` under
+`_piCasSubagentTranscript`.  The Task stub's `renderResult`
+(`src/task-stub.ts`) looks for this field and renders the nested
+transcript.
+
+### Required SDK option
+
+`forwardSubagentText: true` in `provider.ts ensureSession`.  Without
+this, only subagent tool_use/tool_result blocks are forwarded by the
+SDK (the "heartbeat counter" default), and the rendered transcript
+shows only the tool calls — no reasoning text.
+
+### Renderer (task-stub.ts)
+
+Modeled on
+[pi-subagent](https://github.com/mariozechner/pi-subagent)'s
+`renderResult`:
+
+- Collapsed view: title row + last ~10 display items + usage line.
+- Expanded view (Ctrl+O): `Container` with task prompt, tool calls
+  formatted via `formatToolCall` (Bash → `$ cmd`, Read → `path:offset`,
+  etc.), and the subagent's final Markdown answer.
+- `formatToolCall` is the per-call formatter; exported so we can
+  reuse it for nested Task calls inside subagents.
+
+### Defensive cleanup
+
+`cleanupLeakedSubagentToolUses` runs when a typed subagent
+`assistant` message arrives carrying tool_use blocks we'd already
+tracked from SSE partials.  In practice the SDK does NOT emit
+subagent SSE partials (verified empirically by the probe); this
+function is a no-op safety net in case future SDK versions or
+options ever change that behavior.  When triggered, it removes
+leaked ids from `pendingToolUseIds`, `segmentToolUseIds`, and
+`output.content` so the main segment can still close.
+
+### Limitations
+
+- **No live progress.**  Pi only sees the rendered transcript once
+  the segment closes (after the parent Task tool_result arrives).
+  Mid-flight progress would require emitting partial pi events
+  during the SDK's subagent run.  `recordProgress()` updates the
+  transcript in real time, but pi doesn't see it.
+- **Nested subagents.**  A subagent could spawn its own subagent.
+  Each level is captured as its own flat transcript keyed by its
+  direct parent tool_use_id.  Rendering a nested tree (subagent
+  inside subagent) is not implemented — the inner subagent's
+  transcript ends up attached to the inner Task tool_result, which
+  appears as one of the OUTER subagent's tool_results.  The outer
+  Task render shows it as a Task tool call but doesn't recursively
+  expand the inner transcript.
+
+See `writeups/subagent_investigation.md` for SDK surface details and
+remaining open questions.
+
 ## Known limitations
 
 1. **No pi UI for tool permission prompts.**  `permissionMode:
@@ -233,13 +380,41 @@ on SDK `result` events with `is_error: true`; the provider reads it via
    handler is post-execution and side-effect-free, which is fine.
 4. **Cancel latency.**  `query.interrupt()` waits for the SDK's current
    tool handler to complete.
-5. **Fork/compact loses model history.**  Tear-down-and-respawn for v1.
-   SDK's `forkSession + resumeSessionAt` could preserve history; deferred.
-6. **Unknown SDK tool emits would crash pi.**  We rely on
-   `tools: [...SUPPORTED_CC_TOOL_NAMES]` in SDK opts to constrain the
-   model.  If the SDK ever emits a tool not in that list (e.g. via skill
-   activation), pi fails with `Tool <name> not found`.  Adding a
-   defensive catch-all stub in event-bridge could mitigate.
+5. **Fork has full-source-session vs partial-source-session ambiguity.**
+   v2 uses `forkSession()` to preserve model history across the fork
+   (good), but copies the full source SDK session — not just up to the
+   pi entry where the fork happened.  Needs pi-entry-id ↔
+   SDK-message-uuid map; deferred.  See "Fork & compact handling".
+   - Sub-limitation: `config.pendingFork` is a single slot.  If a user
+     forks two different sessions in rapid succession WITHOUT opening
+     either fork destination in between, the second fork overwrites the
+     first and the first fork destination ends up resumed into the
+     second fork's SDK session (wrong model context).  Unusual flow;
+     pinned by a unit test.  Mitigation would be a
+     `Map<sourcePiSessionId, forkedSdkId>` plus a way to associate the
+     new pi session id with its source (probably via the
+     `previousSessionFile` field on `session_start(reason="fork")`).
+6. **Compact reduces pi's view but not the SDK's.**  v2 keeps the SDK
+   subprocess alive across pi compaction (preserves model history),
+   but doesn't tell the SDK to compact.  Token cost on the SDK side is
+   unchanged.  The SDK has its own auto-compaction; explicit forwarding
+   via `/compact` user-message is deferred.
+7. **Unknown SDK tool emits no longer crash pi** (resolved).  The
+   bridge's `onUnknownToolName` hook + provider's catch-all stub
+   registration prevent `Tool <name> not found`.  See "Catch-all stub"
+   section above.
+8. **Subagent transcripts rendered, but no live progress.**  The
+   captured subagent transcript is rendered inline under the parent
+   Task call (Phase B shipped), but the user doesn't see the
+   subagent's output until the subagent completes (pi-cas holds the
+   bridging segment open until the parent tool_result arrives).
+   `recordProgress` updates the transcript in real time but pi has no
+   way to render it mid-flight under current architecture.  See
+   "Subagent capture + rendering" for the design and limitations.
+9. **Nested subagents not recursively expanded.**  A subagent spawning
+   its own subagent produces a transcript at each level keyed by
+   direct parent.  The outer renderer shows the inner Task as a tool
+   call but doesn't recursively expand the inner transcript.
 
 ## Failed approaches (preserved for context)
 

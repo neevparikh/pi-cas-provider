@@ -16,7 +16,9 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   SUPPORTED_CC_TOOL_NAMES,
   createStubTools,
+  createGenericStub,
   isSupportedStubTool,
+  isValidDynamicToolName,
 } from "../src/stub-tools.js";
 import { put, clear, type CachedToolResult } from "../src/tool-result-cache.js";
 
@@ -128,6 +130,83 @@ describe("stub-tools", () => {
     expect((result.details as any)._piCasIsError).toBe(false);
     // Should NOT have a _piCasToolUseResult field when we successfully spread.
     expect((result.details as any)._piCasToolUseResult).toBeUndefined();
+  });
+
+  describe("createGenericStub (catch-all)", () => {
+    it("creates a stub with the given name and pulls cached results just like named stubs", async () => {
+      const stub = createGenericStub("Task");
+      expect(stub.name).toBe("Task");
+      // Loose schema — accepts arbitrary arguments without validation.
+      put("tu-task", {
+        content: [{ type: "text", text: "subagent completed" }],
+        isError: false,
+        toolName: "Task",
+        details: { result: "done" },
+      });
+      const result = await stub.execute(
+        "tu-task",
+        { description: "do thing", prompt: "go" } as any,
+        undefined,
+        undefined,
+        {} as any,
+      );
+      expect(result.content).toEqual([{ type: "text", text: "subagent completed" }]);
+      expect((result.details as any).result).toBe("done");
+      expect((result.details as any)._piCasIsError).toBe(false);
+      expect((result.details as any)._piCasToolName).toBe("Task");
+    });
+
+    it("cache miss path returns the same defensive error shape as named stubs", async () => {
+      const stub = createGenericStub("WebFetch");
+      const result = await stub.execute("never-cached", { url: "x" } as any, undefined, undefined, {} as any);
+      expect((result.details as any)._piCasStubError).toBe("cache-miss");
+      expect((result.details as any)._piCasIsError).toBe(true);
+      expect((result.content[0] as any).text).toMatch(/no cached result for WebFetch/i);
+    });
+
+    it("conservative executionMode='sequential' (we don't know if the unknown tool is side-effecting)", () => {
+      const stub = createGenericStub("UnknownThing");
+      expect(stub.executionMode).toBe("sequential");
+    });
+
+    it("label / description make clear this is a dynamic stub", () => {
+      const stub = createGenericStub("Foo");
+      expect(stub.label).toMatch(/dynamic stub/i);
+      expect(stub.description).toMatch(/catch-all/i);
+    });
+
+    it("rejects invalid tool names with a clear error", () => {
+      expect(() => createGenericStub("")).toThrow(/invalid tool name/i);
+      expect(() => createGenericStub("has space")).toThrow(/invalid tool name/i);
+      expect(() => createGenericStub("starts-with-dash")).toThrow(/invalid tool name/i);
+      // The provider should also validate before calling, but defense in depth.
+    });
+  });
+
+  describe("isValidDynamicToolName", () => {
+    it("accepts PascalCase CC built-in shapes", () => {
+      expect(isValidDynamicToolName("Bash")).toBe(true);
+      expect(isValidDynamicToolName("Task")).toBe(true);
+      expect(isValidDynamicToolName("WebFetch")).toBe(true);
+      expect(isValidDynamicToolName("NotebookEdit")).toBe(true);
+    });
+    it("accepts MCP server tool naming (mcp__server__tool)", () => {
+      expect(isValidDynamicToolName("mcp__workspace__bash")).toBe(true);
+      expect(isValidDynamicToolName("a_b_c_d")).toBe(true);
+    });
+    it("rejects empty / whitespace / punctuation / too long", () => {
+      expect(isValidDynamicToolName("")).toBe(false);
+      expect(isValidDynamicToolName(" ")).toBe(false);
+      expect(isValidDynamicToolName("a b")).toBe(false);
+      expect(isValidDynamicToolName("foo-bar")).toBe(false);
+      expect(isValidDynamicToolName("foo/bar")).toBe(false);
+      expect(isValidDynamicToolName("foo.bar")).toBe(false);
+      expect(isValidDynamicToolName("1Bash")).toBe(false); // must start with letter
+      expect(isValidDynamicToolName("a".repeat(129))).toBe(false);
+      // non-string defensive
+      expect(isValidDynamicToolName(undefined as unknown as string)).toBe(false);
+      expect(isValidDynamicToolName(null as unknown as string)).toBe(false);
+    });
   });
 
   it("each stub has the right executionMode", () => {

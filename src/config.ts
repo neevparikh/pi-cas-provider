@@ -76,6 +76,34 @@ export interface ProviderConfig {
    * picks up changes without restart.
    */
   permissionMode: PermissionMode;
+  /**
+   * Set by `registerProvider` after the named stubs are registered.  Called
+   * by the event bridge's `onUnknownToolName` hook the first time the SDK
+   * emits a tool_use with a name not in {@link SUPPORTED_CC_TOOL_NAMES}.
+   *
+   * Idempotent: tracks an internal set of already-registered names so
+   * repeated calls for the same name are no-ops.  See provider.ts where it
+   * is constructed.
+   */
+  registerDynamicStub?: (toolName: string) => void;
+  /**
+   * Fork bookkeeping: when pi forks a session, the `session_before_fork`
+   * handler calls `forkSession()` on the SDK to create a forked copy of the
+   * current SDK session and stashes the result here.  The next
+   * `streamSimple` for a brand-new pi session id (which is the forked
+   * branch) consumes this entry and uses the forked SDK session id as its
+   * `resume` target, preserving model history across the fork.
+   *
+   * Cleared as soon as it's consumed.  Only one fork can be pending at a
+   * time — pi forks are user-driven (one click → one fork → wait), so this
+   * isn't a practical limitation.
+   */
+  pendingFork?: {
+    /** Pi session id of the source session being forked from. */
+    sourcePiSessionId: string;
+    /** New SDK session UUID produced by `forkSession()`. */
+    forkedSdkSessionId: string;
+  };
 }
 
 /**

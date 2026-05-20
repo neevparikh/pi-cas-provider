@@ -32,12 +32,23 @@ through Claude Code's settings layer, not the raw Messages API.
 
 ## What you get
 
-- **Six Claude Code built-in tools.** Bash, Read, Write, Edit, Grep, Glob.
-  The SDK runs them natively inside the bundled `claude` subprocess; pi-cas
-  registers stub pi tools matching the CC names so pi's agent loop can
-  display each tool call and its result, but the actual execution happens
-  inside the SDK.  Other CC tools (WebFetch, Agent, NotebookEdit, skill
-  activations, etc.) are NOT exposed to the model in this provider.
+- **Full Claude Code tool preset.** Bash, Read, Write, Edit, Grep, Glob,
+  `Task` (subagents), WebFetch, WebSearch, NotebookEdit, TodoWrite,
+  ExitPlanMode, plus any MCP tools the SDK surfaces.  Six of these
+  (Bash, Read, Write, Edit, Grep, Glob) + Task have hand-tuned pi stubs
+  registered at startup; the rest get a catch-all stub registered at
+  runtime the first time the SDK emits one (one warning per name to
+  stderr).  All tools execute natively inside the bundled `claude`
+  subprocess; pi's stub just retrieves the cached result.
+- **Subagent transcripts rendered inline.** When the model uses the
+  `Task` tool to delegate to a subagent, pi-cas captures the
+  subagent's reasoning, intermediate tool calls, and final answer
+  (via the SDK's `forwardSubagentText: true` option), then renders
+  them nested under the parent Task call using a layout modeled on
+  the [pi-subagent](https://github.com/mariozechner/pi-subagent)
+  extension.  Collapsed view shows the last few tool calls + usage
+  summary; press Ctrl+O to expand the full transcript with the
+  subagent's Markdown answer.
 - **Fast mode opt-in.** A slash command (`/cas-fast on`) or env var
   (`PI_CAS_FAST_MODE=1`) flips fast mode for Opus turns. Fast mode is only
   picked up at SDK-session spawn time, so toggling it mid-session takes
@@ -407,17 +418,36 @@ Key points:
   no resume injection within a pi process.
 - Cross-process resume reattaches to a persisted SDK session id and only
   sends the trailing user message (no double-replay).
+- Fork preserves model history (via SDK `forkSession()`).  Compact keeps
+  the SDK session alive (pi compacts its view; the model uses full
+  internal history).
+- Catch-all stub registration: pi-cas survives the SDK emitting tool
+  names we didn't pre-register (warns to stderr, registers a generic
+  stub at runtime).
 - SDK control APIs (`setModel`, `setPermissionMode`, `interrupt`) work
   mid-session.
 - Auth inheritance via `ANTHROPIC_API_KEY` (Anthropic Console).
 
 ### Known caveats
 
-- **Restricted tool surface.** Only the six CC built-in tools listed above
-  are exposed to the model.  No `WebFetch`, `WebSearch`, `Agent`,
-  `NotebookEdit`, skills, etc.  If a future CC release introduces new
-  default tools, the model loses access to them until pi-cas's
-  `SUPPORTED_CC_TOOL_NAMES` is updated.
+- **Open tool surface + catch-all stub.** The SDK exposes the full
+  `claude_code` tool preset to the model (see "What you get" above).
+  Tools we didn't pre-register at startup get a generic stub registered
+  the first time the SDK emits one, with a warning to stderr.  Pi will
+  not crash with `Tool <name> not found`.  This includes `Task`
+  (subagents), WebFetch, WebSearch, NotebookEdit, TodoWrite, ExitPlanMode,
+  and any MCP server tools.
+- **Subagent transcripts are rendered inline (Phase B shipped).**
+  Subagent inner events (`parent_tool_use_id != null` typed messages,
+  `system.task_*`) are captured into a per-Task transcript and attached
+  to the Task tool_result's cache entry.  The Task stub's
+  `renderResult` displays the nested view (reasoning text, tool calls
+  with `formatToolCall` styling, final Markdown answer, token/cost
+  stats).  Limitation: live progress while the subagent is running is
+  NOT shown — pi only sees the result once the subagent completes
+  (because pi-cas holds the bridging segment open until the parent
+  tool_result arrives).  Adding mid-flight progress would require
+  emitting partial pi events during the SDK's subagent run; deferred.
 - **Pi permission UI is bypassed.** With the default
   `permissionMode: "bypassPermissions"`, the SDK runs every tool without
   prompting.  Pi's own approval flow / tool-hook extensions are NOT
@@ -441,10 +471,27 @@ Key points:
 - **Cancel latency.** `query.interrupt()` does not propagate into
   in-flight tool handlers; the current tool must complete before the
   model's turn stops.
-- **Fork/compact loses model history.** When pi forks or compacts the
-  session, pi-cas tears down the long-lived SDK subprocess and the next
-  streamSimple spawns fresh with no history.  The SDK's `forkSession +
-  resumeSessionAt` could preserve history; deferred to v2.
+- **Fork preserves model history (but may include extra context).**
+  When pi forks, pi-cas calls the SDK's `forkSession()` so the forked
+  branch resumes into a copy of the source SDK session — the model
+  keeps its prior context across the fork.  Limitation: we currently
+  copy the *full* source session, not just the portion up to the pi
+  fork point.  If you fork from a middle entry, the model on the
+  forked branch may have slightly more context than pi's truncated UI
+  shows.  Future work: a pi-entry-id ↔ SDK-message-uuid map enabling
+  `forkSession({ upToMessageId })`.  If `forkSession()` itself fails
+  (e.g. SDK transcript not on disk), pi-cas falls back to the older
+  behavior (forked branch starts with no model history) and warns to
+  stderr.
+- **Compact: pi UI compacts, SDK keeps full history.**  On
+  `session_before_compact`, pi-cas no longer tears down the SDK
+  subprocess — pi compacts its visible transcript, the SDK retains its
+  full internal history.  Result: the model continues to have full
+  context (better answers), but compaction doesn't reduce token cost on
+  the SDK side.  The SDK has its own auto-compaction
+  (`autoCompactThreshold` setting) that kicks in independently.  Future
+  work: forward pi's compact event to the SDK via the `/compact`
+  user-message slash command so the two views stay in sync.
 - **Pollution of `~/.claude/projects/`.** The SDK writes its own JSONL
   transcript per session under Claude Code's default project dir.  Set
   `PI_CAS_CLAUDE_CONFIG_DIR` to isolate.
