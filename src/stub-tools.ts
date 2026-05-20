@@ -96,7 +96,16 @@ async function executeStub(
             `before pi's loop got here. Please file a bug.]`,
         },
       ],
-      details: { _piCasStubError: "cache-miss", toolName, toolCallId },
+      // Mark as error so pi-cas's tool_result hook propagates isError=true
+      // to pi's ToolResultMessage — a cache miss is a real internal failure
+      // and should surface to the user/UI as such, not as a silent
+      // "successful" tool execution.
+      details: {
+        _piCasStubError: "cache-miss",
+        _piCasIsError: true,
+        _piCasToolName: toolName,
+        toolCallId,
+      },
     };
   }
   if (DEBUG) {
@@ -108,18 +117,34 @@ async function executeStub(
   // Pi's agent-core conveys errors via thrown exceptions (per the
   // AgentTool.execute contract).  But our "error" tool results are not
   // execution failures of the stub — they're successful retrievals of an
-  // error result the SDK produced.  Returning them as content with isError
-  // baked into details is the closest analogue; pi's UI can decide how to
-  // render based on details if it wants.  We do NOT throw, because that
-  // would surface to the user as a pi-cas-internal error rather than as
-  // the model's tool actually-failing-its-task.
+  // error result the SDK produced.  Returning them as content with the
+  // error flag stuffed into details is the closest analogue; pi-coding-
+  // agent's `tool_result` event handler reads `_piCasIsError` post-hoc
+  // (see provider.ts) and overrides ToolResultMessage.isError accordingly.
+  // We do NOT throw, because that would surface to the user as a
+  // pi-cas-internal error rather than as the model's tool failing its task.
+  //
+  // Detail-shape handling: SDKUserMessage.tool_use_result is structured
+  // (e.g. {stdout, stderr, ...} for Bash) for success and a plain string
+  // for some failures ("Error: Exit code 7").  Spreading a string into
+  // an object would corrupt it into {0: "E", 1: "r", ...}, so we only
+  // spread when the SDK detail is a non-null plain object.  For other
+  // shapes (string, array, undefined, primitive), we preserve the
+  // original under `_piCasToolUseResult` so callers can still introspect.
+  const sdkDetails = entry.details;
+  const detailsIsPlainObject =
+    sdkDetails !== null && typeof sdkDetails === "object" && !Array.isArray(sdkDetails);
+  const details: Record<string, unknown> = detailsIsPlainObject
+    ? { ...(sdkDetails as Record<string, unknown>) }
+    : {};
+  if (!detailsIsPlainObject && sdkDetails !== undefined) {
+    details._piCasToolUseResult = sdkDetails;
+  }
+  details._piCasIsError = entry.isError;
+  details._piCasToolName = entry.toolName;
   return {
     content: entry.content,
-    details: {
-      ...((entry.details as Record<string, unknown>) ?? {}),
-      _piCasIsError: entry.isError,
-      _piCasToolName: entry.toolName,
-    },
+    details,
   };
 }
 

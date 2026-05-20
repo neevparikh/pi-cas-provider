@@ -43,17 +43,16 @@ describe("classifyNewContent", () => {
     expect(r.realUserBlocks).toEqual([{ type: "text", text: "hello" }]);
   });
 
-  it("array-content user message → kind=real with each block", () => {
+  it("array-content user message → kind=real with each block (canonical pi ImageContent)", () => {
+    // Canonical pi-ai ImageContent shape is FLAT: { type, data, mimeType }.
+    // See node_modules/@earendil-works/pi-ai/dist/types.d.ts:157.
     const r = classifyNewContent(
       [
         {
           role: "user",
           content: [
             { type: "text", text: "look at this" },
-            {
-              type: "image",
-              image: { data: "BASE64", mimeType: "image/png" },
-            },
+            { type: "image", data: "BASE64", mimeType: "image/png" },
           ],
         },
       ],
@@ -63,9 +62,47 @@ describe("classifyNewContent", () => {
     expect(r.kind).toBe("real");
     expect(r.realUserBlocks).toHaveLength(2);
     expect(r.realUserBlocks[0]).toEqual({ type: "text", text: "look at this" });
-    expect(r.realUserBlocks[1]).toMatchObject({
+    expect(r.realUserBlocks[1]).toEqual({
       type: "image",
-      source: { type: "base64", media_type: "image/png" },
+      source: { type: "base64", media_type: "image/png", data: "BASE64" },
+    });
+  });
+
+  it("image block in nested legacy shape (image: {data, mimeType}) is also translated", () => {
+    const r = classifyNewContent(
+      [
+        {
+          role: "user",
+          content: [{ type: "image", image: { data: "BASE64", mimeType: "image/jpeg" } }],
+        },
+      ],
+      0,
+      recent(),
+    );
+    expect(r.realUserBlocks).toEqual([
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "BASE64" } },
+    ]);
+  });
+
+  it("image block already in Anthropic shape is passed through", () => {
+    const r = classifyNewContent(
+      [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "AAA" },
+            },
+          ],
+        },
+      ],
+      0,
+      recent(),
+    );
+    expect(r.realUserBlocks[0]).toMatchObject({
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "AAA" },
     });
   });
 

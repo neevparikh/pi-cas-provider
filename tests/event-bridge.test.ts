@@ -140,7 +140,7 @@ describe("event-bridge stream-aligned segmentation", () => {
   it("text-only single segment closes on message_stop with stop reason 'stop'", async () => {
     const bridge = createEventBridge(fakeModel);
     const stream = createAssistantMessageEventStream();
-    bridge.attachStream(stream);
+    bridge.attachStream(stream, fakeModel);
 
     bridge.handle(sysInit("sess-1"));
     bridge.handle(messageStart());
@@ -171,7 +171,7 @@ describe("event-bridge stream-aligned segmentation", () => {
   it("tool-use segment waits for tool_result before closing", () => {
     const bridge = createEventBridge(fakeModel);
     const stream = createAssistantMessageEventStream();
-    bridge.attachStream(stream);
+    bridge.attachStream(stream, fakeModel);
 
     bridge.handle(messageStart());
     bridge.handle(cbStartText(0));
@@ -207,7 +207,7 @@ describe("event-bridge stream-aligned segmentation", () => {
   it("parallel tool_uses: segment waits for ALL paired tool_results", () => {
     const bridge = createEventBridge(fakeModel);
     const stream = createAssistantMessageEventStream();
-    bridge.attachStream(stream);
+    bridge.attachStream(stream, fakeModel);
 
     bridge.handle(messageStart());
     bridge.handle(cbStartToolUse(0, "tu-a", "Bash"));
@@ -234,7 +234,7 @@ describe("event-bridge stream-aligned segmentation", () => {
 
     // Segment 1: text + tool_use
     const stream1 = createAssistantMessageEventStream();
-    bridge.attachStream(stream1);
+    bridge.attachStream(stream1, fakeModel);
     bridge.handle(messageStart());
     bridge.handle(cbStartText(0));
     bridge.handle(cbDeltaText(0, "let me check"));
@@ -252,7 +252,7 @@ describe("event-bridge stream-aligned segmentation", () => {
 
     // Segment 2: continuation text
     const stream2 = createAssistantMessageEventStream();
-    bridge.attachStream(stream2);
+    bridge.attachStream(stream2, fakeModel);
     bridge.handle(messageStart());
     bridge.handle(cbStartText(0));
     bridge.handle(cbDeltaText(0, "result was ok"));
@@ -269,7 +269,7 @@ describe("event-bridge stream-aligned segmentation", () => {
   it("result event after segment closes triggers isTurnDone; resetTurn rearms", () => {
     const bridge = createEventBridge(fakeModel);
     const stream = createAssistantMessageEventStream();
-    bridge.attachStream(stream);
+    bridge.attachStream(stream, fakeModel);
 
     bridge.handle(messageStart());
     bridge.handle(cbStartText(0));
@@ -290,7 +290,7 @@ describe("event-bridge stream-aligned segmentation", () => {
   it("error tool_result preserves is_error in cache", () => {
     const bridge = createEventBridge(fakeModel);
     const stream = createAssistantMessageEventStream();
-    bridge.attachStream(stream);
+    bridge.attachStream(stream, fakeModel);
 
     bridge.handle(messageStart());
     bridge.handle(cbStartToolUse(0, "tu-err", "Bash"));
@@ -309,7 +309,7 @@ describe("event-bridge stream-aligned segmentation", () => {
 
   it("string tool_result content is wrapped into [{type:text}]", () => {
     const bridge = createEventBridge(fakeModel);
-    bridge.attachStream(createAssistantMessageEventStream());
+    bridge.attachStream(createAssistantMessageEventStream(), fakeModel);
     bridge.handle(messageStart());
     bridge.handle(cbStartToolUse(0, "tu-1", "Bash"));
     bridge.handle(cbStop(0));
@@ -322,7 +322,7 @@ describe("event-bridge stream-aligned segmentation", () => {
 
   it("after closeSegment(), tool-use ids list is queryable for the closed segment, then resets", () => {
     const bridge = createEventBridge(fakeModel);
-    bridge.attachStream(createAssistantMessageEventStream());
+    bridge.attachStream(createAssistantMessageEventStream(), fakeModel);
     bridge.handle(messageStart());
     bridge.handle(cbStartToolUse(0, "tu-x", "Bash"));
     bridge.handle(cbStop(0));
@@ -337,10 +337,44 @@ describe("event-bridge stream-aligned segmentation", () => {
     expect(bridge.getCurrentSegmentToolUseIds()).toEqual([]);
   });
 
+  it("mid-session model switch is reflected in output.model and used for cost", () => {
+    const bridge = createEventBridge(fakeModel);
+    const otherModel = {
+      ...(fakeModel as any),
+      id: "claude-opus-4-6",
+      name: "Opus 4.6",
+      provider: "anthropic",
+      cost: { input: 30, output: 150, cacheRead: 0, cacheWrite: 0 },
+    } as Model<any>;
+
+    // First segment under the original model.
+    bridge.attachStream(createAssistantMessageEventStream(), fakeModel);
+    bridge.handle(messageStart());
+    bridge.handle(cbStartText(0));
+    bridge.handle(cbDeltaText(0, "hi"));
+    bridge.handle(cbStop(0));
+    bridge.handle(messageDelta("end_turn"));
+    bridge.handle(messageStop());
+    const seg1 = bridge.closeSegment();
+    expect(seg1.model).toBe(fakeModel.id);
+
+    // Second segment after a mid-session model switch.
+    bridge.attachStream(createAssistantMessageEventStream(), otherModel);
+    bridge.handle(messageStart());
+    bridge.handle(cbStartText(0));
+    bridge.handle(cbDeltaText(0, "opus says hi"));
+    bridge.handle(cbStop(0));
+    bridge.handle(messageDelta("end_turn"));
+    bridge.handle(messageStop());
+    const seg2 = bridge.closeSegment();
+    expect(seg2.model).toBe(otherModel.id);
+    expect(seg2.provider).toBe(otherModel.provider);
+  });
+
   it("thinking blocks pass through with thinking_start/delta/end events", async () => {
     const bridge = createEventBridge(fakeModel);
     const stream = createAssistantMessageEventStream();
-    bridge.attachStream(stream);
+    bridge.attachStream(stream, fakeModel);
 
     bridge.handle(messageStart());
     bridge.handle({

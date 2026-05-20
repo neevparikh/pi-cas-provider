@@ -77,8 +77,13 @@ type PiStopReason = AssistantMessage["stopReason"];
 
 export interface EventBridge {
   /** Bind a new pi event stream for the next segment.  Called by provider
-   * at the start of each streamSimple call. */
-  attachStream(stream: AssistantMessageEventStream): void;
+   * at the start of each streamSimple call.
+   *
+   * `model` is the model selected for THIS segment.  Pi sessions can switch
+   * model mid-conversation (via the model picker / setModel control); the
+   * bridge needs the current model for accurate `output.model` recording
+   * and cost calculation. */
+  attachStream(stream: AssistantMessageEventStream, model: Model<any>): void;
 
   /** Feed one SDK message. */
   handle(msg: any): void;
@@ -118,7 +123,12 @@ export interface EventBridge {
   getCost(): number | undefined;
 }
 
-export function createEventBridge(model: Model<any>): EventBridge {
+export function createEventBridge(initialModel: Model<any>): EventBridge {
+  // Current model for this segment.  Updated on `attachStream` so a
+  // mid-session model switch is reflected in both the recorded
+  // `output.model` and `calculateCost()` per-token rates.
+  let currentModel: Model<any> = initialModel;
+
   // Cross-segment / cross-turn state.
   let sdkSessionId: string | undefined;
   let fastModeState: "off" | "cooldown" | "on" | undefined;
@@ -126,7 +136,7 @@ export function createEventBridge(model: Model<any>): EventBridge {
 
   // Per-segment state — reset on each new Anthropic message_start.
   let stream: AssistantMessageEventStream | undefined;
-  let output: AssistantMessage = freshOutput(model);
+  let output: AssistantMessage = freshOutput(currentModel);
   let blocks: Tracked[] = [];
   let pendingToolUseIds = new Set<string>();
   let segmentToolUseIds: string[] = [];
@@ -137,7 +147,7 @@ export function createEventBridge(model: Model<any>): EventBridge {
   let rawStopReason: string | undefined;
 
   function resetSegment(): void {
-    output = freshOutput(model);
+    output = freshOutput(currentModel);
     blocks = [];
     pendingToolUseIds = new Set();
     segmentToolUseIds = [];
@@ -409,7 +419,7 @@ export function createEventBridge(model: Model<any>): EventBridge {
       output.usage.output +
       output.usage.cacheRead +
       output.usage.cacheWrite;
-    calculateCost(model, output.usage);
+    calculateCost(currentModel, output.usage);
   }
 
   function appendFinalBlock(b: any): void {
@@ -478,8 +488,20 @@ export function createEventBridge(model: Model<any>): EventBridge {
   }
 
   return {
-    attachStream(s) {
+    attachStream(s, model) {
       stream = s;
+      // Adopt the segment's selected model.  Mid-session switches (via
+      // pi's model picker / setModel) need this so output.model and
+      // calculateCost both reflect the new model, not the one we were
+      // first constructed with.  If the segment is currently in-progress
+      // (rare), also refresh output.model so existing accumulators stay
+      // consistent with the new rates.
+      const modelChanged = model.id !== currentModel.id || model.provider !== currentModel.provider;
+      currentModel = model;
+      if (modelChanged) {
+        output.provider = model.provider;
+        output.model = model.id;
+      }
       // If we're starting a NEW segment (because the previous one's done was
       // pushed and the iterator is paused at a message boundary), reset segment
       // state.  If we're mid-segment (rare — provider should always close

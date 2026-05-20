@@ -78,12 +78,56 @@ describe("stub-tools", () => {
     expect((second.details as any)?._piCasStubError).toBe("cache-miss");
   });
 
-  it("execute() with cache miss returns a clearly-marked error result", async () => {
+  it("execute() with cache miss returns a clearly-marked error result with _piCasIsError=true", async () => {
     const read = createStubTools().find((t) => t.name === "Read")!;
     const result = await read.execute("never-cached", { file_path: "/tmp/foo" }, undefined, undefined, {} as any);
     expect(result.content[0]).toMatchObject({ type: "text" });
     expect((result.content[0] as any).text).toMatch(/no cached result/i);
     expect((result.details as any)._piCasStubError).toBe("cache-miss");
+    // Cache miss MUST propagate as an error so the provider's tool_result
+    // handler sets isError on pi's ToolResultMessage — otherwise an internal
+    // failure is silently rendered as a successful tool execution.
+    expect((result.details as any)._piCasIsError).toBe(true);
+  });
+
+  it("execute() preserves a string SDK details payload under _piCasToolUseResult", async () => {
+    // SDK reports some Bash failures with a plain string for tool_use_result
+    // (e.g. "Error: Exit code 7").  Spreading a string would corrupt it into
+    // {0:"E", 1:"r", ...}, so the stub puts it under a named field instead.
+    put("tu-strerr", {
+      content: [{ type: "text", text: "failed" }],
+      isError: true,
+      toolName: "Bash",
+      details: "Error: Exit code 7",
+    });
+    const bash = createStubTools().find((t) => t.name === "Bash")!;
+    const result = await bash.execute("tu-strerr", {}, undefined, undefined, {} as any);
+    expect((result.details as any)._piCasToolUseResult).toBe("Error: Exit code 7");
+    expect((result.details as any)._piCasIsError).toBe(true);
+    // The string should NOT have been spread into numeric character keys.
+    expect((result.details as any)["0"]).toBeUndefined();
+  });
+
+  it("execute() spreads structured SDK details (object) into pi details", async () => {
+    put("tu-bash", {
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      toolName: "Bash",
+      details: {
+        stdout: "hello",
+        stderr: "",
+        interrupted: false,
+        isImage: false,
+        noOutputExpected: false,
+      },
+    });
+    const bash = createStubTools().find((t) => t.name === "Bash")!;
+    const result = await bash.execute("tu-bash", {}, undefined, undefined, {} as any);
+    expect((result.details as any).stdout).toBe("hello");
+    expect((result.details as any).stderr).toBe("");
+    expect((result.details as any)._piCasIsError).toBe(false);
+    // Should NOT have a _piCasToolUseResult field when we successfully spread.
+    expect((result.details as any)._piCasToolUseResult).toBeUndefined();
   });
 
   it("each stub has the right executionMode", () => {

@@ -504,7 +504,10 @@ function streamViaSDK(
 
     // 6. Attach the persistent bridge to the new pi stream and consume
     //    SDK events until the bridge signals "segment ready".
-    session.bridge.attachStream(stream);
+    // Pass the current segment's model into the bridge so that output.model
+    // and cost calculation reflect any mid-session model switch we applied
+    // above (session.query.setModel).
+    session.bridge.attachStream(stream, model);
     session.inFlight = true;
     try {
       if (enqueuePromise) {
@@ -765,6 +768,23 @@ async function ensureSession(
   // can't use `for await`-with-break across multiple turns.
   const iter = (q as any)[Symbol.asyncIterator]() as AsyncIterator<any>;
 
+  // Determine where the "new" content starts in pi's transcript:
+  //   - Resumed SDK session: the SDK already has all prior turns in its
+  //     own JSONL.  We must NOT replay the historical pi messages — that
+  //     would re-enqueue every user prompt the SDK already saw.  Pi's
+  //     calling convention is that the trailing message in context.messages
+  //     is the user input prompting THIS streamSimple call, so skip
+  //     everything before that.
+  //   - Fresh SDK session with no pi history: messages.length is 0 or 1
+  //     and the formula gives 0.
+  //   - Fresh SDK session WITH pi history (e.g. pi resumed a session that
+  //     was previously routed through a different provider): we have no
+  //     good answer.  Sending all prior user messages without their
+  //     assistant pairs would mislead the model into thinking it had
+  //     responded.  Sending only the trailing message loses context but
+  //     is consistent.  Documented as a known limitation in writeups.
+  const initialLastSent = Math.max(0, context.messages.length - 1);
+
   const session: PiSession = {
     piSessionId,
     sdkSessionId: undefined,
@@ -779,11 +799,7 @@ async function ensureSession(
     cwd,
     model: model.id,
     permissionMode: config.permissionMode,
-    // We're about to enqueue the message that corresponds to context.messages
-    // up to and including the most recent user-side block.  Mark "everything
-    // before this call" as already consumed; the calling streamSimple will
-    // update lastSentCount = context.messages.length after extracting.
-    lastSentCount: 0,
+    lastSentCount: initialLastSent,
   };
   sessionRef.current = session;
   // Splice the local closure waker onto the session so teardown can find it.
@@ -961,21 +977,45 @@ function piBlockToAnthropic(block: any): any | null {
   switch (block.type) {
     case "text":
       return { type: "text", text: block.text ?? "" };
-    case "image":
-      // Pi uses { type: "image", image: { data, mimeType } } sometimes; the
-      // Anthropic shape is { type: "image", source: { type: "base64", media_type, data } }.
-      if (block.source) return block; // already Anthropic-shaped
-      if (block.image) {
+    case "image": {
+      // Three shapes we accept:
+      //   1. Pi's canonical ImageContent (pi-ai types.d.ts:157):
+      //      { type:"image", data: <base64>, mimeType }     ← flat
+      //   2. Anthropic shape (already-translated):
+      //      { type:"image", source: { type:"base64", media_type, data } }
+      //   3. Nested legacy/defensive shape:
+      //      { type:"image", image: { data, mimeType } }
+      if (block.source) return block; // (2) already Anthropic-shaped
+      const nested = block.image;
+      if (nested && (nested.data || nested.mimeType)) {
         return {
           type: "image",
           source: {
             type: "base64",
-            media_type: block.image.mimeType ?? "image/png",
-            data: block.image.data,
+            media_type: nested.mimeType ?? "image/png",
+            data: nested.data ?? "",
           },
         };
       }
+      if (typeof block.data === "string") {
+        // (1) canonical pi ImageContent — flat fields on the block itself.
+        return {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: block.mimeType ?? "image/png",
+            data: block.data,
+          },
+        };
+      }
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] WARN: image block with no recognized shape; dropping`,
+          Object.keys(block ?? {}).join(","),
+        );
+      }
       return null;
+    }
     case "toolResult":
     case "tool_result":
       // Handled at the message level in classifyNewContent; skip here.

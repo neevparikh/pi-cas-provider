@@ -26,10 +26,23 @@ section for what this replaced.)
 - Prompt is an `AsyncIterable<SDKUserMessage>` that stays open for the
   whole session; each new turn enqueues one user message.
 - The SDK runs every tool natively (`permissionMode: "bypassPermissions"`
-  by default; configurable via `/cas-perm`).  Pi-cas never invokes
-  `--resume`, so the bundled `claude` binary's resume normalizer (the
-  source of the original "Picking up where I left off…" bug) is never
-  engaged.
+  by default; configurable via `/cas-perm`).  In steady state (within a
+  pi process) pi-cas never invokes `--resume`, so the bundled `claude`
+  binary's resume normalizer (the source of the original "Picking up
+  where I left off…" bug) is not engaged for turn-to-turn operation.
+- **Cross-process resume.** When pi-cas's persisted state records an SDK
+  session id (`getSessionMapping`/`setSessionMapping` in
+  `persistence.ts`), the FIRST query after a pi process restart DOES use
+  `--resume <id>` to reattach to the SDK's prior conversation.  In that
+  case the SDK already has the full transcript internally, so pi-cas
+  initializes `lastSentCount = max(0, context.messages.length - 1)` on
+  session creation to mark all but the trailing user message as
+  already-consumed.  Without this, classifyNewContent would re-enqueue
+  every historical user message to the SDK, double-sending them.  The
+  normalizer pain doesn't reappear in practice because the SDK's own
+  JSONL is a clean record of its own emissions — the original bug came
+  from pi-cas synthesizing transcripts to feed the SDK, which we no
+  longer do.
 
 ### Layer 2 — Stream-aligned segmentation + stub tools
 
