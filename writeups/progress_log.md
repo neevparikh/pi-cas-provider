@@ -78,3 +78,98 @@ The pivot stands. The synth-asst marker fix is the right ship-now answer. Option
 
 ### Result
 Tests: 73/73 pass. Typecheck clean. E2E probe still passes all 5 scenarios.
+
+---
+
+## Option A refactor regression: pi tries to execute CC tool names 05/19/2026 20:00 - commit a59ed68 (regression discovered)
+
+### What was discovered
+After shipping the Option A refactor (a59ed68), an end-to-end test surfaced
+`Tool Bash not found` errors visible to the user during tool turns.
+
+Root cause analysis (in conversation, not in code yet):
+- Option A's design comment in `provider.ts:20–21` claims pi-cas just
+  forwards `tool_use` blocks to pi for display. **This is wrong about pi's
+  behavior.**
+- Pi's agent loop (`pi-agent-core/dist/agent-loop.js:113-117`) unconditionally
+  executes every `toolCall` content block in an assistant message via
+  `executeToolCalls`, regardless of stopReason.
+- Pi's tool registry uses lowercase names (`bash`, `read`, `edit`). The SDK
+  emits CC names (`Bash`, `Read`, `Edit`). `prepareToolCall` raises
+  `Tool Bash not found`.
+- Pi's `AssistantMessage.content` type literally has no slot for
+  "display-only" tool calls (`type.d.ts:191`: `(TextContent | ThinkingContent
+  | ToolCall)[]`). The contract is: any `ToolCall` in content means execute.
+
+The misconception arose because Option A's design was validated in a probe
+that bypassed pi entirely (`probe-refactor-e2e.mjs` simulates pi but doesn't
+run pi's actual agent loop).
+
+### Approach considered and rejected
+
+1. **Strip toolCalls from `output.content` before `done`.** Lossy — hides
+   tool history from the user.
+2. **Use SDK's `canUseTool` to deny+interrupt the SDK's tool execution, let
+   pi run tools.** Investigated in detail. `canUseTool` denial generates a
+   synthetic `is_error` tool_result that lives forever in the SDK's session
+   JSONL (sdk.d.ts:3242). On the next API call the request would contain
+   both the synthetic deny tool_result AND our injection of the real one
+   from pi, with the same `tool_use_id` — Anthropic API rejects, model
+   confused. Confirmed via prior `PreToolUse` probe (this conversation).
+3. **Revert to per-turn `query()` + transcript reconstruction (pre-refactor).**
+   Works but reintroduces the resume normalizer maintenance burden the
+   Option A refactor was specifically trying to escape.
+4. **Drop the SDK entirely.** Talk to Anthropic API directly using SDK's
+   auth. Loses the SDK's value proposition.
+
+### Approach chosen: stream-aligned segmentation + stub tools
+
+Key insight: the SDK ALREADY runs tools correctly. We don't need to change
+tool execution. We need to fix the impedance mismatch between the SDK's
+multi-message turn (one `query()` user message → many assistant messages
+with tools running between them) and pi's turn-by-turn loop.
+
+Design:
+- Keep Option A's long-lived `query()` per pi session.
+- Stop accumulating all SDK assistant messages into one pi `done`. Instead,
+  break per SDK assistant message: push one pi `done` per assistant message.
+- Wait for `user(tool_result)` SDKUserMessage events before pushing
+  `done(toolUse)`. Cache the results keyed by `tool_use_id`.
+- Register pi tools matching CC tool names (`Bash`, `Read`, `Write`, `Edit`,
+  `Grep`, `Glob`, etc.) whose `execute()` returns the cached result.
+  Side-effect-free, instant — the SDK already executed the real tool.
+- On pi's next `streamSimple` (which arrives with the phantom toolResults
+  from pi running our stubs), detect that all new content is phantom
+  toolResults with ids we just emitted → don't enqueue to the SDK, just
+  resume consuming events from the persistent iterator for the next SDK
+  assistant message.
+
+### Validation probes
+
+Wrote two probes (committed at `probe-stub-tools.mjs` and
+`probe-stub-tools-edge.mjs`) hitting the real Anthropic API + SDK:
+
+**Basic probe** (Bash → echo hello, echo second):
+- `content_block_stop` of `tool_use` arrives at 4938ms / 5289ms
+- `message_stop` at 5351ms
+- `user(tool_result)` for both ids at 5535-5536ms (after message_stop)
+- next `message_start` at 7783ms (~2s gap)
+
+**Edge case probe** (parallel Bash, one with `exit 7`):
+- Both `tool_use` blocks in one assistant message ✓
+- Both `tool_result` events arrive (5786ms, 5806ms) before next message_start (7468ms) ✓
+- Error result comes through with `is_error: true`, no crash ✓
+- `SDKUserMessage.tool_use_result` carries `{stdout, stderr, interrupted,
+  isImage, noOutputExpected}` for success, plain error string for failure ✓
+
+### Pi-side feasibility confirmed
+- `pi.registerTool` (loader.js:178) writes into the extension's tool map
+  and calls `runtime.refreshTools()` — tools become visible in
+  `currentContext.tools` for the agent loop.
+- `AgentToolResult.terminate?: boolean` is optional, default false — our
+  stubs simply don't set it, pi continues looping, giving us the next tick.
+- `AgentToolResult` has both model-facing `content` and arbitrary `details`
+  — we pass through `tool_use_result` as details for nicer UI.
+
+### Next step
+Implement the refactor.

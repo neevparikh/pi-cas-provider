@@ -1,66 +1,44 @@
 /**
- * The provider-managed system-prompt block. Appended to pi's `context.systemPrompt`
- * before the prompt is handed to the Agent SDK.
+ * Provider-managed system-prompt block appended to pi's `context.systemPrompt`
+ * before handing off to the Agent SDK.
  *
- * Documents tool-behavior deltas from Claude Code defaults that the shim does NOT
- * paper over (because they can't be losslessly translated). Captured from empirical
- * tool-schema diffs between Claude Code v2.1.143 and pi v0.74.0.
+ * # What this clarifies for the model
+ *
+ * Pi's own system prompt typically refers to tools by pi's lowercase names
+ * (`bash`, `read`, `edit`, ...).  In the pi-cas-via-SDK setup, the actual
+ * tool definitions in the API request come from the Agent SDK and use
+ * Claude Code's PascalCase names (`Bash`, `Read`, `Edit`, ...).  The model
+ * is heavily trained on Claude Code's names and schemas, so it tends to
+ * pick the PascalCase tools from the API anyway, but we add a short note
+ * so it never gets stuck wondering why pi's instructions reference names
+ * that don't appear in its toolset.
+ *
+ * # What this does NOT do
+ *
+ * In a previous architecture (the pre-Option-A revision) pi-cas executed
+ * tools itself with its own arg shapes, and the system prompt warned the
+ * model about CC \u2192 pi schema deltas ("timeout in SECONDS not ms",
+ * "replace_all is silently ignored", etc.).  That layer is gone.  The
+ * Agent SDK runs CC tools with their NATIVE schemas; pi-cas's job is
+ * purely to cache results and surface them to pi via stub tools.  So we
+ * removed all the schema-translation notes; the model just uses CC tools
+ * as designed.
  */
 
-export const PROVIDER_SHIM_NOTES = `<pi-environment-override>
-*** TOOL CALLING OVERRIDE — SUPERSEDES THE SYSTEM PROMPT ABOVE ***
+export const PROVIDER_SHIM_NOTES = `<pi-environment-note>
+In this environment your tools come from Claude Code: \`Bash\`, \`Read\`, \`Write\`,
+\`Edit\`, \`Grep\`, \`Glob\`.  Use them as you normally would.
 
-The system prompt above describes pi's tools with lowercase names (read, write,
-edit, bash, grep, find). Those names refer to the SAME tools you have, but in
-this environment you MUST call them using their Claude Code names (PascalCase)
-with Claude Code argument schemas. A shim translates names and arguments to pi
-automatically. Do not call pi's lowercase names — the lowercase names are not
-registered tools here and will fail.
-
-Use exactly these tool names:
-
-- Read(file_path: absolute path, offset?, limit?)
-    Same as pi's read. Pass paths as file_path, not path.
-    Note: PDFs via pages are not supported.
-
-- Write(file_path: absolute path, content)
-    Same as pi's write. No prior Read required (unlike standard Claude Code).
-    Pi creates parent directories automatically.
-
-- Edit(file_path: absolute path, old_string, new_string)
-    Performs a single exact-string replacement. NOTE: replace_all is silently
-    ignored — to replace multiple occurrences, call Edit more than once with
-    progressively more specific old_string values. No prior Read required.
-
-- Bash(command, timeout?)
-    NOTE: timeout is in SECONDS not milliseconds (e.g. timeout: 30 = 30s).
-    run_in_background, description, dangerouslyDisableSandbox are dropped.
-    BashOutput / KillShell tools do not exist here. Bash is always synchronous.
-    Output truncated to ~2000 lines / 50KB; full output saved to a temp file.
-
-- Grep(pattern, path?, glob?, -i?, context?, head_limit?)
-    output_mode, -A, -B, -o, type, multiline, offset are NOT supported.
-    Output is always matching lines with file paths and line numbers.
-    Use -i: true for case-insensitive. Use context: N for symmetric context
-    (no asymmetric -A/-B). head_limit defaults to 100.
-
-- Glob(pattern, path?)
-    Standard glob matching. Pi's backend caps results at 1000 by default.
-
-The following Claude Code tools are NOT available and will fail:
-Agent, AskUserQuestion, NotebookEdit, WebFetch, WebSearch, EnterPlanMode,
-ExitPlanMode, Skill, EnterWorktree, ExitWorktree, Monitor, PushNotification,
-ScheduleWakeup, CronCreate, CronDelete, CronList, TaskCreate, TaskGet, TaskList,
-TaskUpdate, TaskOutput, TaskStop.
-
-When pi's instructions mention a custom tool by name (e.g. subagent, or any
-domain-specific tool registered via pi.registerTool), call it by that exact
-name — those go through MCP unchanged.
-</pi-environment-override>`;
+If pi's instructions above mention tools using lowercase names like \`bash\`,
+\`read\`, \`edit\`, \`write\`, \`grep\`, \`find\`, those refer to the same underlying
+operations \u2014 just call the PascalCase Claude Code tools instead.  No other
+Claude Code tools are available in this environment (no \`WebFetch\`, \`Agent\`,
+\`NotebookEdit\`, etc.).
+</pi-environment-note>`;
 
 /**
- * Compose the final system prompt: pi's prompt followed by the shim notes.
- * If pi did not provide a system prompt, only the notes are sent.
+ * Compose the final system prompt: pi's prompt followed by the environment
+ * note.  If pi did not provide a system prompt, only the note is sent.
  */
 export function composeSystemPrompt(piSystemPrompt: string | undefined): string {
   const parts: string[] = [];

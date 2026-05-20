@@ -1,50 +1,63 @@
 /**
- * Top-level provider wiring: registers the pi provider, slash commands, and
- * orchestrates the per-turn streamSimple call through the Agent SDK.
+ * Top-level provider wiring: registers the pi provider, slash commands,
+ * stub tools, and orchestrates per-turn streamSimple through the Agent SDK.
  *
- * # Architecture: long-lived query() per pi session
+ * # Architecture: long-lived query() + stream-aligned segmentation + stub tools
  *
- * Pi-cas used to spawn a fresh `query()` per turn and resume via the SDK's
- * `sessionStore` / `resume` options.  That triggered the bundled `claude`
- * binary's resume normalizer (`gG8 → iO6 → Xg5`) on every turn and required
- * elaborate transcript reconstruction (see git history: `src/transcript.ts`,
- * `src/session-store.ts`, both deleted in this refactor).
+ * Two layered design decisions resolved two distinct problems:
  *
- * The new architecture:
+ * **Layer 1 — long-lived query() per pi session** (carried over from
+ * Option A): avoids the bundled `claude` binary's resume normalizer
+ * (`gG8 → iO6 → Xg5`) on every turn.  Pi-cas spawns ONE `query()` per pi
+ * session and reuses it forever.  The SDK manages its own JSONL transcript
+ * internally; pi-cas never feeds history back via `--resume`.
  *
- *   - ONE long-lived `query()` per pi session, lazily spawned on the first
- *     `streamSimple` call.
- *   - Prompt is an `AsyncIterable<SDKUserMessage>` that stays open for the
- *     session's lifetime; each pi turn enqueues one user message.
- *   - The SDK runs all tools natively (`permissionMode: "bypassPermissions"`
- *     by default).  Pi-cas does NOT execute tools — it merely forwards
- *     `tool_use`/`tool_result` stream events to pi for display.
- *   - The SDK owns the on-disk JSONL transcript (under CLAUDE_CONFIG_DIR/
- *     projects/<dirhash>/<sdk-session-id>.jsonl).  Pi-cas's history view is
- *     authoritative for what pi displays; the SDK's view is authoritative
- *     for what the model sees.
+ * **Layer 2 — stream-aligned segmentation + stub tools** (the current
+ * refactor): bridges the SDK's multi-message turn (one user input → many
+ * assistant messages with tools running between them) onto pi's turn-by-turn
+ * loop, without pi attempting to re-execute the tools the SDK already ran.
  *
- * # Per-turn flow
+ * - The SDK runs every tool natively inside its long-lived `query()`.
+ *   `tool_result` events are captured as the SDK emits them and stored in
+ *   a per-session result cache (`tool-result-cache.ts`).
+ * - For each CC built-in tool we expose to the model (`Bash`, `Read`,
+ *   `Write`, `Edit`, `Grep`, `Glob`), pi-cas registers a *stub* pi tool of
+ *   the same name (`stub-tools.ts`).  When pi's agent loop "executes" the
+ *   stub, it just looks up the SDK's cached result — instant, no side
+ *   effects.
+ * - The event bridge (`event-bridge.ts`) closes one pi `done` per SDK
+ *   assistant message instead of per turn.  Pi sees a normal
+ *   text+toolCalls assistant message, runs stubs, loops streamSimple for
+ *   the next segment.
+ * - When pi calls streamSimple back with the resulting phantom
+ *   `toolResult`s (results that originated from our stubs), pi-cas detects
+ *   them and DOES NOT enqueue them to the SDK — it just consumes the next
+ *   SDK assistant message from the persistent iterator.
  *
- *   1. Resolve the per-session `PiSession` (lazy spawn on first turn).
- *   2. Detect model / permissionMode changes from prior turn → invoke
- *      `query.setModel()` / `query.setPermissionMode()` on the existing
- *      subprocess.  No restart needed.
- *   3. Extract the NEW user content from `context.messages` (everything
- *      after `lastSentCount`), concat any user-side blocks, enqueue into
- *      the AsyncIterable.
- *   4. Consume SDK events until `result`, bridge them into pi's stream.
- *   5. Push `done` with the final accumulated assistant message.
+ * # Per-segment flow
+ *
+ *   1. Resolve the per-session `PiSession` (lazy spawn on first call).
+ *   2. Detect model / permissionMode changes from prior segment → invoke
+ *      `query.setModel()` / `query.setPermissionMode()`.
+ *   3. Classify the new user input from `context.messages.slice(lastSentCount)`:
+ *      - All-phantom (only toolResults with ids we recently emitted) →
+ *        skip enqueueing; just consume the next SDK assistant message.
+ *      - Real input (text/image/new user message + maybe phantom
+ *        toolResults) → enqueue the real blocks into the SDK prompt
+ *        iterator.
+ *   4. Attach the new pi stream to the persistent event bridge.
+ *   5. Consume SDK events until the bridge says the segment is ready.
+ *   6. Bridge pushes `done(toolUse|stop|length)` and ends the pi stream.
+ *   7. If stopReason was end_turn / length, also drain the SDK's `result`
+ *      event off the iterator so it doesn't poison the next turn.
  *
  * # Lifecycle integration
  *
- *   - `session_start`: lazy spawn — defer until first streamSimple.
  *   - `session_shutdown`: tear down the long-lived query (gen.return() +
  *     interrupt()).
  *   - `session_before_fork` / `session_before_compact`: tear down and clear
  *     the pi-session → SDK-session mapping so the next streamSimple spawns
- *     a fresh query (v1 limitation: model history is lost on fork; SDK's
- *     forkSession + resumeSessionAt support is deferred to v2).
+ *     a fresh query (v1 limitation: model history is lost on fork).
  *
  * # Concurrency invariant
  *
@@ -68,9 +81,14 @@ import { composeSystemPrompt } from "./system-prompt.js";
 import { mapEffort } from "./effort.js";
 import { buildThinkingConfig } from "./thinking.js";
 import { buildFastModeOptions, modelSupportsFastMode } from "./settings.js";
-import { createEventBridge } from "./event-bridge.js";
+import { createEventBridge, type EventBridge } from "./event-bridge.js";
 import { getAuthStatus, formatAuthBanner, formatAuthDetails } from "./auth.js";
 import { FastModeBadge } from "./badge.js";
+import {
+  createStubTools,
+  isSupportedStubTool,
+  SUPPORTED_CC_TOOL_NAMES,
+} from "./stub-tools.js";
 import {
   type ProviderConfig,
   createDefaultConfig,
@@ -115,6 +133,19 @@ interface PiSession {
    * This was confirmed empirically against the SDK's iterator semantics.
    */
   iter: AsyncIterator<any>;
+  /**
+   * Persistent event bridge that consumes SDK events and emits pi events
+   * in segment-aligned chunks (one pi `done` per SDK assistant message).
+   * Created once per pi session and reused across every streamSimple call.
+   */
+  bridge: EventBridge;
+  /**
+   * Tool-use ids emitted on the most recently closed segment.  Used to
+   * recognize "phantom" toolResult messages from pi (results from our stub
+   * tools running) on the next streamSimple call, so we don't accidentally
+   * forward them to the SDK as new user content.
+   */
+  recentlyEmittedToolUseIds: Set<string>;
   /** FIFO queue of pending user messages to yield into the AsyncIterable. */
   promptQueue: Array<{ content: any; resolved: () => void; failed: (e: any) => void }>;
   /** Resolver for the awaitable inside the prompt-gen loop. */
@@ -205,6 +236,34 @@ export function registerProvider(pi: ExtensionAPI): void {
 
   const badge = new FastModeBadge(pi);
   badge.update({ intent: config.fastMode });
+
+  // Register stub tools that pi's agent loop will "execute" by retrieving
+  // SDK-cached results.  See `stub-tools.ts` for the full rationale.
+  for (const tool of createStubTools()) {
+    pi.registerTool(tool);
+  }
+  if (DEBUG) {
+    console.error(
+      `[pi-cas/debug] registered ${SUPPORTED_CC_TOOL_NAMES.length} stub tools: ` +
+        SUPPORTED_CC_TOOL_NAMES.join(", "),
+    );
+  }
+
+  // Register a `tool_result` event handler so the SDK's `is_error` flag
+  // on each tool_result propagates to pi's ToolResultMessage.isError.
+  // The stub tool stuffs the flag into `details._piCasIsError`; we read it
+  // here and return an override.  (AgentTool.execute has no `isError`
+  // return field — pi infers isError from whether execute() throws.
+  // Throwing would lose the SDK's structured details, so we use this
+  // post-hoc override instead.)
+  pi.on("tool_result", (event) => {
+    if (!isSupportedStubTool(event.toolName)) return undefined;
+    const flag = (event.details as Record<string, unknown> | undefined)?._piCasIsError;
+    if (typeof flag === "boolean") {
+      return { isError: flag };
+    }
+    return undefined;
+  });
 
   // Lifecycle: tear down on shutdown / fork / compact.  See module docstring.
   registerLifecycleHooks(pi, config);
@@ -374,25 +433,28 @@ function streamViaSDK(
       );
     }
 
-    // 3. Extract the new user-side content from pi's messages.
-    const newUserBlocks = extractNewUserContent(context.messages, session.lastSentCount);
+    // 3. Classify the new pi-side content since lastSentCount.
+    const classification = classifyNewContent(
+      context.messages,
+      session.lastSentCount,
+      session.recentlyEmittedToolUseIds,
+    );
     session.lastSentCount = context.messages.length;
 
     if (DEBUG) {
       console.error(
-        `[pi-cas/debug] new user blocks: ${newUserBlocks.length} (types=${newUserBlocks
-          .map((b: any) => b.type)
-          .join(",")})`,
+        `[pi-cas/debug] classify: kind=${classification.kind} ` +
+          `realBlocks=${classification.realUserBlocks.length} ` +
+          `phantomIds=${classification.phantomToolResultIds.length} ` +
+          `unexpectedIds=${classification.unexpectedToolResultIds.length}`,
       );
     }
 
-    // No new user content → either pi sent us a no-op or the SDK already
-    // handled this internally.  Push an empty `done` to keep pi happy.
-    if (newUserBlocks.length === 0) {
-      const empty: any = makeEmptyAssistantMessage(model);
-      stream.push({ type: "done", reason: "stop", message: empty } as any);
-      stream.end();
-      return;
+    if (classification.unexpectedToolResultIds.length > 0 && DEBUG) {
+      console.error(
+        `[pi-cas/debug] WARN: unexpected toolResult ids (not in recently-emitted set): ` +
+          classification.unexpectedToolResultIds.join(", "),
+      );
     }
 
     // 4. Hook up abort.
@@ -407,37 +469,56 @@ function streamViaSDK(
       }
     }
 
-    // 5. Enqueue the new user message into the long-lived gen.
-    const enqueuePromise = new Promise<void>((resolve, reject) => {
-      session.promptQueue.push({
-        content: newUserBlocks,
-        resolved: resolve,
-        failed: reject,
-      });
-      if (session.genWaker) {
-        const w = session.genWaker;
-        session.genWaker = null;
-        w();
-      }
-    });
+    // 5. Decide what to do based on classification.
+    //
+    //   - "phantom": pi is calling us back after running stub tools.  Don't
+    //     enqueue — just consume the next SDK assistant message.
+    //   - "real": pi has new user content (text/image/etc).  Enqueue it.
+    //   - "empty": no new content at all (no-op call).  Push empty done.
+    if (classification.kind === "empty") {
+      const empty: any = makeEmptyAssistantMessage(model);
+      stream.push({ type: "done", reason: "stop", message: empty } as any);
+      stream.end();
+      if (options?.signal) options.signal.removeEventListener("abort", abortListener);
+      return;
+    }
 
-    // 6. Consume SDK events for this turn.
-    const bridge = createEventBridge(stream, model);
+    let enqueuePromise: Promise<void> | undefined;
+    if (classification.kind === "real") {
+      enqueuePromise = new Promise<void>((resolve, reject) => {
+        session.promptQueue.push({
+          content: classification.realUserBlocks,
+          resolved: resolve,
+          failed: reject,
+        });
+        if (session.genWaker) {
+          const w = session.genWaker;
+          session.genWaker = null;
+          w();
+        }
+      });
+    }
+    // If kind === "phantom", we just consume more SDK events with no enqueue.
+    // The SDK is mid-turn (between assistant messages, internally running
+    // tools); the next event we read will be the next assistant message_start.
+
+    // 6. Attach the persistent bridge to the new pi stream and consume
+    //    SDK events until the bridge signals "segment ready".
+    session.bridge.attachStream(stream);
     session.inFlight = true;
     try {
-      // Wait until the gen has actually yielded our message before we start
-      // counting events for "this turn" — otherwise a delayed prior turn
-      // could leak events into ours.  enqueuePromise resolves inside the
-      // gen body after `yield` returns control.
-      await enqueuePromise;
+      if (enqueuePromise) {
+        // Wait until the gen has actually yielded our message before we
+        // start consuming — otherwise a still-in-flight prior segment's
+        // tail could leak into ours.  enqueuePromise resolves inside the
+        // gen body after `yield` returns control.
+        await enqueuePromise;
+      }
 
-      // The query's event consumer is shared across all turns.  We pluck
-      // events off the persistent iterator until we see a `result`.
-      //
-      // NOTE: we MUST NOT use `for await ... break`, which calls
-      // `iter.return()` and closes the generator.  We use the iterator
-      // directly so subsequent turns keep reading from the same stream.
-      while (true) {
+      // Consume events into the bridge until either a segment closes
+      // (message_stop + all tool_results paired) OR the turn ends without
+      // any segment (empty/error turn).
+      while (!session.bridge.isSegmentReady() && !session.bridge.isTurnDone()) {
         const next = await session.iter.next();
         if (next.done) {
           if (DEBUG) console.error(`[pi-cas/debug] iter exhausted unexpectedly`);
@@ -450,7 +531,7 @@ function streamViaSDK(
             JSON.stringify({ subtype: msg.subtype, result: msg.result }, null, 2),
           );
         }
-        // Capture sdk_session_id from the very first init event.
+        // Capture sdk_session_id from the first init event we see.
         if (
           !session.sdkSessionId &&
           msg.type === "system" &&
@@ -460,14 +541,49 @@ function streamViaSDK(
           session.sdkSessionId = msg.session_id;
           setSessionMapping(session.piSessionId, msg.session_id);
         }
-        bridge.handle(msg);
-        if (msg.type === "result") {
-          break;
+        session.bridge.handle(msg);
+      }
+
+      if (!session.bridge.isSegmentReady() && session.bridge.isTurnDone()) {
+        // Turn ended without any assistant message (empty / error turn).
+        // Synthesize an empty done and rearm the bridge for the next turn.
+        if (DEBUG) console.error("[pi-cas/debug] turn ended without segment; pushing empty done");
+        const empty = makeEmptyAssistantMessage(model);
+        stream.push({ type: "done", reason: "stop", message: empty } as any);
+        stream.end();
+        session.bridge.resetTurn();
+        session.inFlight = false;
+        return;
+      }
+
+      // Capture the segment's tool-use ids BEFORE closing (closeSegment
+      // resets per-segment state).  These become the "phantom" set for
+      // the next streamSimple.
+      const segmentToolUseIds = session.bridge.getCurrentSegmentToolUseIds();
+      const segmentStopReason = session.bridge.getSegmentStopReason();
+      session.bridge.closeSegment();
+      session.recentlyEmittedToolUseIds = new Set(segmentToolUseIds);
+
+      // If the segment closed at end_turn / length (not toolUse), the SDK
+      // will emit `result` next.  Drain it off the iterator so it doesn't
+      // poison subsequent streamSimples — those expect to see message_start
+      // for the next user turn, not a stale result.  After draining, call
+      // resetTurn() so the bridge is ready for the next SDK turn.
+      if (segmentStopReason !== "toolUse" && !session.bridge.isTurnDone()) {
+        while (!session.bridge.isTurnDone()) {
+          const next = await session.iter.next();
+          if (next.done) break;
+          session.bridge.handle(next.value);
+          if (next.value?.type === "result") break;
         }
+      }
+      if (segmentStopReason !== "toolUse") {
+        // Whether we drained here or it had already been drained, rearm.
+        session.bridge.resetTurn();
       }
     } catch (err: any) {
       if (DEBUG) console.error(`[pi-cas/debug] consume loop threw:`, err);
-      pushError(stream, model, err?.message ?? String(err), bridge);
+      pushError(stream, model, err?.message ?? String(err));
       session.inFlight = false;
       return;
     } finally {
@@ -478,12 +594,12 @@ function streamViaSDK(
     session.inFlight = false;
 
     // 7. Fast-mode state + badge update.
-    const fms = bridge.getFastModeState();
+    const fms = session.bridge.getFastModeState();
     config.lastModel = model.id;
     if (fms) config.lastFastModeState = fms;
     if (DEBUG && fms) {
       console.error(
-        `[pi-cas/debug] fast_mode_state=${fms}, cost=$${bridge.getCost()?.toFixed(4) ?? "?"}`,
+        `[pi-cas/debug] fast_mode_state=${fms}, cost=$${session.bridge.getCost()?.toFixed(4) ?? "?"}`,
       );
     }
     badge.update({
@@ -501,19 +617,6 @@ function streamViaSDK(
           "https://code.claude.com/docs/en/fast-mode#requirements",
       );
     }
-
-    // 8. Push final done.
-    const output = bridge.getOutput();
-    const hasToolCalls = output.content.some((c) => c.type === "toolCall");
-    const reason: "stop" | "length" | "toolUse" =
-      output.stopReason === "toolUse" || hasToolCalls
-        ? "toolUse"
-        : output.stopReason === "length"
-          ? "length"
-          : "stop";
-    output.stopReason = reason;
-    stream.push({ type: "done", reason, message: output } as any);
-    stream.end();
   })();
 
   return stream;
@@ -645,6 +748,11 @@ async function ensureSession(
     includePartialMessages: true,
     cwd,
     env,
+    // Restrict the model's tool surface to exactly the CC built-ins we have
+    // pi stubs for (see stub-tools.ts).  If the model emits a tool_use whose
+    // name isn't in this list, pi's agent loop will fail with `Tool <name>
+    // not found` because we wouldn't have a stub registered.
+    tools: [...SUPPORTED_CC_TOOL_NAMES],
     ...(resumeId ? { resume: resumeId } : {}),
     ...(fastFrag.extraArgs ? { extraArgs: fastFrag.extraArgs } : {}),
     effort: mapEffort(options?.reasoning),
@@ -662,6 +770,8 @@ async function ensureSession(
     sdkSessionId: undefined,
     query: q,
     iter,
+    bridge: createEventBridge(model),
+    recentlyEmittedToolUseIds: new Set(),
     promptQueue,
     genWaker: null,
     ended: false,
@@ -735,46 +845,116 @@ function buildSubprocessEnv(
   return env;
 }
 
-/* ----------------------------- message extraction ----------------------------- */
+/* ----------------------------- message classification ----------------------------- */
 
 /**
- * Extract the new user-side content from pi's messages, starting at
- * `fromIndex`.  Returns a single Anthropic-style content array suitable
- * for one `SDKUserMessage`.
+ * Result of classifying a streamSimple call's new content (everything in
+ * `context.messages.slice(lastSentCount)`).
  *
- * In the Option A architecture pi-cas does NOT execute tools, so:
- *   - We only care about new user messages.
- *   - Assistant messages are ignored (the SDK already has them).
- *   - Tool result messages are ignored (the SDK already executed and saw
- *     the result internally; pi shouldn't be feeding them back).
- *
- * If pi sends multiple new user messages (rare but possible if it batches
- * turns), we concatenate their content blocks.
+ * Tells the provider whether to enqueue a fresh user message into the SDK
+ * prompt iterator (`real`), skip the enqueue and just consume the next SDK
+ * segment (`phantom`), or push an empty `done` (`empty`).
  */
-function extractNewUserContent(
+interface NewContentClassification {
+  kind: "real" | "phantom" | "empty";
+  /** Anthropic-shaped user content blocks to enqueue (only populated for
+   * `real`).  Excludes any toolResult-derived blocks: the SDK doesn't want
+   * to see pi's phantom tool results.
+   */
+  realUserBlocks: any[];
+  /** ToolResult message ids in the slice whose toolCallId matched our
+   * recently-emitted set — i.e. the expected phantoms from pi running our
+   * stub tools. */
+  phantomToolResultIds: string[];
+  /** ToolResult message ids in the slice that DIDN'T match our recent set.
+   * Logged as a warning; might indicate a pi extension feeding us tool
+   * results we don't expect, or a stale `lastSentCount`. */
+  unexpectedToolResultIds: string[];
+}
+
+/**
+ * Classify the new content in pi's message slice.
+ *
+ * Cases:
+ *   - Slice contains real user content (text/image): `real` (enqueue).
+ *   - Slice contains ONLY toolResult messages, all from our recently-
+ *     emitted set: `phantom` (just consume next SDK events; don't enqueue).
+ *   - Slice is empty or has no user/toolResult role messages: `empty`.
+ *   - Mixed real + phantom: treated as `real`; phantom toolResults are
+ *     dropped (SDK already has them).
+ */
+function classifyNewContent(
   messages: ReadonlyArray<any>,
   fromIndex: number,
-): any[] {
-  const blocks: any[] = [];
+  recentlyEmittedIds: ReadonlySet<string>,
+): NewContentClassification {
+  const realUserBlocks: any[] = [];
+  const phantomToolResultIds: string[] = [];
+  const unexpectedToolResultIds: string[] = [];
+
   for (let i = fromIndex; i < messages.length; i++) {
     const m = messages[i];
-    if (!m || m.role !== "user") continue;
-    if (Array.isArray(m.content)) {
-      for (const block of m.content) {
-        const translated = piBlockToAnthropic(block);
-        if (translated) blocks.push(translated);
+    if (!m) continue;
+
+    if (m.role === "toolResult") {
+      // Pi's top-level toolResult message shape (see pi-ai types.d.ts:203).
+      // The toolCallId tells us whether it's one of ours.
+      const id = m.toolCallId;
+      if (typeof id === "string") {
+        if (recentlyEmittedIds.has(id)) {
+          phantomToolResultIds.push(id);
+        } else {
+          unexpectedToolResultIds.push(id);
+        }
       }
-    } else if (typeof m.content === "string") {
-      blocks.push({ type: "text", text: m.content });
+      continue;
     }
+
+    if (m.role === "user") {
+      if (Array.isArray(m.content)) {
+        for (const block of m.content) {
+          // Pi may embed toolResult blocks inside user messages on some
+          // code paths; treat them the same as top-level toolResult
+          // messages (skip, account for phantom).
+          if (block?.type === "toolResult" || block?.type === "tool_result") {
+            const id = block.toolCallId ?? block.tool_use_id;
+            if (typeof id === "string") {
+              if (recentlyEmittedIds.has(id)) {
+                phantomToolResultIds.push(id);
+              } else {
+                unexpectedToolResultIds.push(id);
+              }
+            }
+            continue;
+          }
+          const translated = piBlockToAnthropic(block);
+          if (translated) realUserBlocks.push(translated);
+        }
+      } else if (typeof m.content === "string") {
+        realUserBlocks.push({ type: "text", text: m.content });
+      }
+      continue;
+    }
+
+    // Assistant messages and anything else: ignored (SDK already has its
+    // own assistant history internally; pi may inject custom messages, etc.).
   }
-  return blocks;
+
+  let kind: NewContentClassification["kind"];
+  if (realUserBlocks.length > 0) {
+    kind = "real";
+  } else if (phantomToolResultIds.length > 0) {
+    kind = "phantom";
+  } else {
+    kind = "empty";
+  }
+
+  return { kind, realUserBlocks, phantomToolResultIds, unexpectedToolResultIds };
 }
 
 /**
  * Translate a pi content block into an Anthropic-shaped block the SDK
- * accepts.  Returns null for blocks we should skip (toolResult — see
- * extractNewUserContent docstring).
+ * accepts.  Returns null for blocks we skip.
  */
 function piBlockToAnthropic(block: any): any | null {
   if (!block || typeof block !== "object") return null;
@@ -784,7 +964,7 @@ function piBlockToAnthropic(block: any): any | null {
     case "image":
       // Pi uses { type: "image", image: { data, mimeType } } sometimes; the
       // Anthropic shape is { type: "image", source: { type: "base64", media_type, data } }.
-      if (block.source) return block;  // already Anthropic-shaped
+      if (block.source) return block; // already Anthropic-shaped
       if (block.image) {
         return {
           type: "image",
@@ -798,7 +978,7 @@ function piBlockToAnthropic(block: any): any | null {
       return null;
     case "toolResult":
     case "tool_result":
-      // SDK runs tools internally; ignore any tool_result blocks from pi.
+      // Handled at the message level in classifyNewContent; skip here.
       return null;
     default:
       // Unknown block type — pass through and let the SDK reject it loudly.
@@ -828,9 +1008,8 @@ function pushError(
   stream: AssistantMessageEventStream,
   model: Model<any>,
   message: string,
-  bridge?: ReturnType<typeof createEventBridge>,
 ): void {
-  const output = bridge ? bridge.getOutput() : makeEmptyAssistantMessage(model);
+  const output = makeEmptyAssistantMessage(model);
   output.stopReason = "error";
   output.errorMessage = message;
   stream.push({ type: "error", reason: "error", error: output } as any);
