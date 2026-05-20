@@ -173,3 +173,111 @@ Wrote two probes (committed at `probe-stub-tools.mjs` and
 
 ### Next step
 Implement the refactor.
+
+---
+
+## Shipped: stream-aligned segmentation + stub tools 05/19/2026 21:30 - commit b42040e
+
+### What was done
+
+Implemented and validated the design proposed in the prior session:
+
+- **New `src/tool-result-cache.ts`** (3 KB): module-singleton
+  `Map<tool_use_id, CachedToolResult>` with one-shot `put`/`take`/`has`
+  semantics.  Cross-session uniqueness via Anthropic's UUID-ish tool_use_ids.
+
+- **New `src/stub-tools.ts`** (9 KB): six pi `ToolDefinition`s, one per
+  CC built-in (`Bash`/`Read`/`Write`/`Edit`/`Grep`/`Glob`).  Each
+  `execute()` calls `take()` from the cache and returns
+  `{content, details}` with `_piCasIsError` stuffed into details for
+  later propagation.  Loose TypeBox schemas (`additionalProperties: true`).
+
+- **Rewrote `src/event-bridge.ts`** (~550 lines): stream-aligned
+  segmenting bridge.  Per-session state machine.  Public surface:
+  `attachStream` / `handle(msg)` / `isSegmentReady()` / `closeSegment()`
+  / `resetTurn()` / various getters.  Holds the segment open until both
+  `message_stop` arrives AND every paired `tool_result` has been
+  ingested.  Caches results as they arrive.
+
+- **Updated `src/provider.ts`** (~420-line diff):
+  - `registerProvider` now registers stub tools via `pi.registerTool`
+    and a `tool_result` handler that propagates `_piCasIsError`.
+  - `PiSession` gained `bridge: EventBridge` and
+    `recentlyEmittedToolUseIds: Set<string>` for phantom detection.
+  - SDK opts gain `tools: [...SUPPORTED_CC_TOOL_NAMES]` to constrain
+    the model.
+  - `streamViaSDK` rewritten for multi-segment driving.  Replaced
+    `extractNewUserContent` with `classifyNewContent` (now exported
+    for tests).
+  - Consume loop tracks `segmentStopReason`; drains `result` event
+    when segment closed at end_turn / length; calls `resetTurn`.
+
+- **Simplified `src/system-prompt.ts`**: dropped the misleading "shim
+  translation" notes (no shim exists in this architecture; SDK runs CC
+  tools with their native arg shapes).  Replaced with a short
+  environment note telling the model to use CC PascalCase names if
+  pi's prompt references lowercase ones.
+
+### New tests (33 total added)
+
+- `tests/tool-result-cache.test.ts` — 6 tests
+- `tests/stub-tools.test.ts` — 7 tests
+- `tests/event-bridge.test.ts` — 9 tests (synthesizes SDK messages,
+  exercises segment lifecycle, parallel tools, errors, thinking blocks,
+  multi-segment turns, resetTurn)
+- `tests/classify-new-content.test.ts` — 11 tests (phantom detection
+  edge cases: real, phantom, mixed, embedded tool_result blocks,
+  unexpected ids, etc.)
+
+### Validation
+
+- `npm run typecheck`: clean.
+- `npm test`: **77/77** pass (was 44/44 before this work).
+- `probe-stub-tools.mjs`: timing assumptions confirmed (one-tool case).
+- `probe-stub-tools-edge.mjs`: parallel tools + error tool_result paths
+  confirmed.
+- `probe-stub-tools-full.mjs` (NEW): drives the full multi-segment
+  flow against the real Anthropic API.  Segments 1 (`done(toolUse)`),
+  2 (phantom toolResults → continuation `done(stop)` with "two" in
+  text), and 3 (follow-up text question → `done(stop)` recalling "two"
+  from prior context) all pass.
+- `probe-refactor-e2e.mjs` (updated for new architecture): 5/5
+  scenarios pass.  Scenarios 2 and 4 reworked to assert
+  segment-aware invariants (done.reason=toolUse for tool turns,
+  done.reason=stop with prior context for follow-ups).
+
+### Real bug found and fixed during implementation
+
+After segment 2 closed in the first multi-segment probe run, the
+provider's consume loop returned without consuming the SDK's `result`
+event.  This left `turnDone=true` set on the bridge for the NEXT
+streamSimple, whose `isSegmentReady()` then returned true immediately
+(`sawMessageStop || !segmentStarted` was the culprit), exiting the
+consume loop without reading any events.  Result: segment 3 returned
+an empty assistant message.
+
+**Fix**: removed the `sawMessageStop = sawMessageStop || !segmentStarted`
+line in the bridge's result handler; added explicit empty-turn handling
+in the provider; added `bridge.resetTurn()` to clear `turnDone` after
+draining the result event for the next turn.
+
+### Choices that may warrant a second look
+
+- **Loose TypeBox schemas on stubs.**  Trade: avoids lockstep
+  maintenance with CC's actual schemas, but pi's UI can't render
+  param-by-param previews (it gets the raw input dict).  Acceptable
+  for v1.
+- **Stuffing `_piCasIsError` into `details`.**  Documented in
+  stub-tools.ts; relies on pi-coding-agent's `tool_result` event
+  override semantics, which IS public API (extensions/types.d.ts).
+- **`tools: SUPPORTED_CC_TOOL_NAMES`** restricts the model's tool
+  surface to exactly the six we stub.  Adding more requires both a
+  stub and a name list update.  Skills/agents/etc are NOT exposed.
+- **No catch-all stub.**  If the SDK ever emits a tool outside our
+  list (e.g. via skill activation we forgot to disable), pi will fail
+  with "Tool X not found".  Could add a defensive catch in
+  event-bridge.
+
+### What's next
+
+Run the review subagents.

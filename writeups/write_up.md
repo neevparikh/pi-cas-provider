@@ -1,180 +1,259 @@
-# pi-cas-provider — "Picking up where I left off" fix
-
-## Pivot disclosure (read first)
-
-The original user instruction was to implement **Option B** in full (long-lived
-`query()` per pi session via AsyncIterable<SDKUserMessage>). Empirical probing
-uncovered that the design depends on `canUseTool: deny+interrupt` firing
-reliably to prevent the SDK from auto-running tools — and it does NOT. The
-bundled binary's auto-classifier auto-allows benign tool calls in ~3ms, without
-calling canUseTool. Confirmed across:
-
-- Pi-cas's exact production config (multiple variations)
-- A clean `CLAUDE_CONFIG_DIR` (rules out user-settings leakage)
-- All four documented `permissionMode` values (`default`, `acceptEdits`, `plan`, `dontAsk`)
-
-The `PreToolUse` hook mechanism DOES fire reliably and CAN block tools, but
-yielding the real tool_result via the gen afterward produces a duplicate
-`tool_use_id` (the binary already paired the hook's deny as a synthetic
-tool_result internally) which the Anthropic API rejects.
-
-So Option B as designed isn't reachable through the SDK's standard surface.
-Reachable alternatives are larger refactors (SDK-runs-tools = Option A, plus
-long-lived query) that change pi-cas's pi-facing contract.
-
-**Shipped instead: a smaller "synth-asst marker" fix.** It solves the bug
-structurally at the transcript layer, ships in a single commit, has E2E
-validation across 5 scenarios, and doesn't change pi-cas's public contract.
-The Option B work is documented as a deferred path with the empirical
-findings preserved.
+# pi-cas-provider — current design
 
 ## Project goal
 
-Fix the "Picking up where I left off" / `(no content)` / `"Continue from where you left off."` injection bug in pi-cas-provider.
+Pi extension that lets pi use Anthropic Claude as a model provider via the
+`@anthropic-ai/claude-agent-sdk` (bundled `claude` subprocess).  Adds support
+for Claude Code auth, fast mode, Okta-OAuth relay, and per-turn HTTP logging.
 
-Root cause (established earlier in the design discussion):
-1. pi-cas spawns one `claude` subprocess per pi turn with `--resume <session-id>` and uses `canUseTool: deny + interrupt` to defer tool execution to pi.
-2. The bundled `claude` binary's resume normalizer (`gG8 → iO6 → DM_ → JM_ → Xg5`) is tuned for `claude --resume` after ctrl-c-mid-tool. When it sees an unpaired `tool_use` (which is the normal shape of pi-cas's on-disk transcript, because the matching `tool_result` arrives via the *next* subprocess via promptGen), `iO6` orphan-prunes the assistant turn, then `Xg5` flags the resulting buffer as `interrupted_turn`, then two synthetic messages get spliced in: `user("Continue from where you left off.")` and `assistant("No response requested.")`.
-3. Those synthetic injections poison the model's view of the conversation, producing "Picking up where I left off…" model output and downstream `(no content)` feedback loops.
+## Status
 
-## Fix shipped: synth-asst marker
+**Stable.**  Stream-aligned-segmentation + stub-tools architecture is the
+current shipping design (commit `b42040e`+).  All unit tests pass (77),
+both e2e probes pass against the real Anthropic API.
 
-Append a synthetic `assistant(model:"<synthetic>", content:[{type:"text", text:"No response requested."}])` entry at the end of every historic transcript JSONL pi-cas hands to `SessionStore.load()`. This makes the buffer end in `assistant` rather than `user(tool_result)`, so:
+## Architecture
 
-- `Xg5`'s `findLastIndex(non-system, non-progress)` lands on an assistant → returns `{kind:"none"}` → no `"Continue from where…"` splice
-- The unconditional `"No response requested."` splice's `if ($[Y].type === "user")` check fails → no `TGH` splice either
-- `iO6`'s orphan-prune is sidestepped because we ALSO move trailing tool_results into the historic JSONL (paired with the last assistant's tool_use), so no tool_use ever appears unpaired on disk.
+Two layered design decisions, each addressing a distinct problem:
 
-The exact strings `"<synthetic>"` and `"No response requested."` match the binary's own internal `jG`/`TGH` constants — so the model has presumably seen this pattern in Claude Code training data (it's what the binary itself synthesizes during ctrl-c recovery).
+### Layer 1 — Long-lived `query()` per pi session
 
-### Why this fix and not Option B (long-lived `query()`)
+(Inherited from the earlier Option A refactor — see "Failed approaches"
+section for what this replaced.)
 
-Option B (keep one `claude` subprocess alive per pi session via a long-lived AsyncIterable<SDKUserMessage> prompt) would structurally eliminate the bug. The SDK docs confirm this pattern is supported. **However, empirical probing during this work revealed two blockers:**
+- **One** `@anthropic-ai/claude-agent-sdk` `query()` per pi session,
+  lazily spawned on first `streamSimple`.
+- Prompt is an `AsyncIterable<SDKUserMessage>` that stays open for the
+  whole session; each new turn enqueues one user message.
+- The SDK runs every tool natively (`permissionMode: "bypassPermissions"`
+  by default; configurable via `/cas-perm`).  Pi-cas never invokes
+  `--resume`, so the bundled `claude` binary's resume normalizer (the
+  source of the original "Picking up where I left off…" bug) is never
+  engaged.
 
-1. **`canUseTool: deny + interrupt` does NOT reliably fire** for benign tool calls. The bundled binary's permission-resolution short-circuits to auto-allow in ~3ms — too fast for an IPC roundtrip to the canUseTool callback. Even with `settingSources: []`, `permissionMode: "default"`, and inline `settings: {permissions:{allow:[]}}`, simple Bash commands like `printf 'foo'` are auto-allowed. The binary's internal auto-classifier bypasses canUseTool for "obviously safe" tools.
+### Layer 2 — Stream-aligned segmentation + stub tools
 
-2. **Pi-cas's current production already has this property.** API request bodies in `/tmp/pi-cas-http-picas.jsonl` confirm: every request ends in `user` (text or tool_result), never `assistant(tool_use)`. The subprocess auto-runs tools and sends a follow-up request with the tool_result. Pi-cas's "break-early on tool_use" is racing the subprocess's auto-run and apparently losing — pi runs tools too, so users get double-execution that idempotent tools (Read, most Bash) tolerate silently.
+(The current refactor — solves the Option A regression.)
 
-This means the Option B design "long-lived query + canUseTool: deny → pi runs tools" is structurally broken at the SDK boundary. To make it work we'd need either:
-- A way to disable the binary's auto-allow short-circuit (no documented option; would require binary changes or undocumented config)
-- An architectural pivot to "SDK runs tools, pi hides the toolCalls from its loop" — changes pi-cas's pi-facing contract significantly (custom message rendering for tool calls, pi history shape changes, custom permission UI, etc.)
+**Problem.**  The SDK's `query()` runs a multi-message turn internally:
+assistant (text+tool_use) → SDK runs tool → assistant (more text/tools) →
+... → assistant (end_turn).  Option A naively accumulated all of these
+into a single pi `done`, but pi's agent loop
+(`pi-agent-core/agent-loop.js:113-117`) unconditionally executes every
+`toolCall` block in an assistant message.  Pi's tool registry has lowercase
+names (`bash`, `read`, …); the SDK emits Claude Code's PascalCase names
+(`Bash`, `Read`, …).  Result: `Tool Bash not found` errors on every tool
+turn.
 
-Both are larger refactors than the bug warrants. The synth-asst marker fix is surgical and verified to work without degrading model output (probe results below).
+**Solution.**  Break per SDK assistant message, not per turn.
 
-## Empirical validation of the synth-asst marker
+- The event bridge (`src/event-bridge.ts`) keeps a per-session state
+  machine that closes ONE pi `done` per SDK `message_stop` (+ all paired
+  `tool_result` SDKUserMessage events).
+- For each CC built-in tool exposed to the model
+  (`SUPPORTED_CC_TOOL_NAMES = [Bash, Read, Write, Edit, Grep, Glob]`),
+  pi-cas registers a *stub* pi tool of the same name
+  (`src/stub-tools.ts`).  When pi's agent loop "executes" the stub, it
+  just retrieves the SDK's already-cached result from
+  `src/tool-result-cache.ts` — instant, no side effects, no double
+  execution.
+- When pi calls `streamSimple` back with the resulting `toolResult`s
+  (which originate from our stubs, not real pi-side execution), the
+  provider's `classifyNewContent` detects them as "phantom" (every
+  `toolCallId` matches an id we just emitted) and DOES NOT enqueue them
+  to the SDK — it just consumes the next SDK assistant message from the
+  persistent iterator.
+- An `is_error` flag from the SDK's tool_result propagates to pi's
+  `ToolResultMessage.isError` via a registered `tool_result` extension
+  event handler (since `AgentTool.execute()` has no `isError` return
+  field — pi infers isError from whether execute throws).
 
-Earlier in the design discussion, probes against the real `claude` binary + the real Anthropic API confirmed:
+**Empirical foundation.**  Validated by two SDK timing probes
+(`probe-stub-tools.mjs`, `probe-stub-tools-edge.mjs`) which confirmed:
+- `user(tool_result)` events arrive AFTER `content_block_stop` of their
+  `tool_use` and BEFORE the next `message_start`.
+- Parallel tool calls produce parallel tool_results, all arriving in the
+  same gap before the next assistant message.
+- Errors come through as `is_error: true` with text content; no crashes,
+  no retries.
+- `SDKUserMessage.tool_use_result` carries `{stdout, stderr, interrupted,
+  isImage, noOutputExpected}` for Bash successes and an error string for
+  failures.  We pass this through to pi's `ToolResultMessage.details`.
 
-Transcript shape (4 entries on disk):
+**Per-segment flow:**
+1. Resolve PiSession (lazy spawn).
+2. Detect mid-session `model` / `permissionMode` changes; apply.
+3. `classifyNewContent` decides: `real` (enqueue), `phantom` (skip
+   enqueue, just consume next segment), or `empty` (push empty done).
+4. Bridge attaches the new pi stream.
+5. Consume SDK events until segment ready OR turn done.
+6. Bridge pushes `done(toolUse|stop|length)` and ends the pi stream.
+7. If segment ended on `end_turn` / `max_tokens`, drain the SDK's
+   `result` event off the iterator and call `bridge.resetTurn()` to
+   rearm for the next turn.
+
+## Non-obvious design decisions
+
+- **Why we don't strip toolCalls before `done`.**  We considered it (it's
+  the simplest fix) but pi loses tool-call rendering entirely — the user
+  doesn't see what the agent did.  Stub tools restore native rendering.
+
+- **Why we don't use `canUseTool: deny+interrupt`.**  See "Failed
+  approaches" below.  Brief version: the SDK records every denial as a
+  synthetic `is_error` tool_result in its session JSONL.  On the next API
+  call the model would see BOTH that synthetic denial AND our real
+  injection of the same `tool_use_id` — API rejects, model confused.
+
+- **Why `tools: [Bash, Read, Write, Edit, Grep, Glob]` and not full CC
+  preset.**  The model can only emit tools we have stubs for.  By
+  restricting the SDK's `tools` to exactly our supported set, we ensure
+  pi's agent loop never encounters an unstubbed tool name (which would
+  fail with `Tool <name> not found`).  Adding more CC tools requires
+  adding both a stub and listing the name in `SUPPORTED_CC_TOOL_NAMES`.
+
+- **Stubs use loose TypeBox schemas (`additionalProperties: true`).**
+  The SDK already validates args against the real CC schemas; the stub
+  re-validating would only add friction (and lockstep maintenance burden
+  if CC's schemas drift).  Pi's `prepareArguments` accepts anything.
+
+- **Cache is one-shot (`take()` removes the entry).**  Pi's agent loop
+  executes each tool call exactly once.  One-shot semantics avoid
+  unbounded memory growth in long-running sessions.
+
+- **Why `_piCasIsError` in `details` instead of throwing.**  Pi's
+  `AgentTool.execute` contract says "throw on failure".  But throwing
+  uses `error.message` as the content, losing the SDK's structured
+  details (stdout/stderr/etc).  We register a `tool_result` event
+  handler that reads the `_piCasIsError` flag from details and overrides
+  `isError` post-execution.  Content + details are preserved.
+
+- **Phantom detection key = `toolCallId`.**  Top-level
+  `ToolResultMessage` blocks carry `toolCallId`; embedded tool_result
+  blocks carry `toolCallId` or `tool_use_id`.  We accept both shapes for
+  forward compatibility with future pi versions.
+
+- **`bridge.resetTurn()` between turns.**  The `turnDone` flag and the
+  state set by `result`-event handling persist across `closeSegment`
+  intentionally — so the provider can drain `result` before returning.
+  After drain, `resetTurn()` clears these so the next turn doesn't see
+  stale `turnDone=true`.
+
+## Module map
+
 ```
-[0] user      — "Run echo hello, then tell me what it printed."
-[1] assistant — text + tool_use(Bash)
-[2] user      — tool_result("hello\n")                    ← paired with [1]
-[3] assistant — { model:"<synthetic>", text:"No response requested." }
+src/
+  provider.ts             — top-level streamViaSDK; PiSession lifecycle;
+                            phantom detection (classifyNewContent);
+                            multi-segment consume loop.
+  event-bridge.ts         — stream-aligned bridge.  attachStream / handle /
+                            isSegmentReady / closeSegment / resetTurn.
+                            Tracks pendingToolUseIds; gates segment-close
+                            on pairing.
+  stub-tools.ts           — six CC ToolDefinitions registered with pi.
+                            execute() looks up cached result.
+  tool-result-cache.ts    — module-singleton Map<tool_use_id, CachedToolResult>.
+  system-prompt.ts        — provider-managed system-prompt block telling
+                            the model to use CC tool names (since pi's
+                            prompt may reference pi's lowercase names).
+  config.ts, persistence.ts, settings.ts, effort.ts, thinking.ts,
+  auth.ts, badge.ts, relay.ts, http-log-proxy.ts
+                          — supporting modules, mostly unchanged from
+                            Option A.
+
+probe-stub-tools.mjs       — SDK event timing probe (basic case).
+probe-stub-tools-edge.mjs  — parallel tools + error tool_result probe.
+probe-stub-tools-full.mjs  — full multi-segment e2e: drives the stub-tool
+                             execution path and asserts segment-by-segment
+                             behavior.
+probe-refactor-e2e.mjs     — broader provider-surface validation (gitignored;
+                             local probe).
+
+tests/                     — vitest suites for each module:
+                             tool-result-cache, stub-tools, event-bridge,
+                             classify-new-content, persistence, relay,
+                             http-log-proxy, thinking.
 ```
 
-API request bodies for 6 different `promptGen` yield variants — all produced 5-message clean API requests with NO synthetic injections, and the model produced meaningful contextual responses (even for empty-string yield).
+## Known limitations
 
-Compared to control (no synth-asst at end): produces 3-5 message corrupted requests with the synthetic `"Continue from where you left off."` and `"No response requested."` injections, and model output begins "Picking up where I left off…".
+1. **No pi UI for tool permission prompts.**  `permissionMode:
+   bypassPermissions` skips all permission checks.  `default` would route
+   through the SDK's auto-classifier/prompt mechanism but pi-cas doesn't
+   forward `can_use_tool` requests to pi's UI — unsafe tools could hang.
+2. **No pi custom tools / extension MCP servers.**  Only the six CC tools
+   in `SUPPORTED_CC_TOOL_NAMES` are exposed to the model.  Pi extensions
+   that register their own tools aren't visible to the SDK and so the
+   model can't call them.  Would require an MCP bridge.
+3. **No pi tool-hook translation.**  Pi extension tool_call hooks see
+   the stub call; the cached result has already been produced.  In
+   practice this means hooks intended to MODIFY or BLOCK tool arguments
+   don't influence the SDK's actual execution.  The current `tool_result`
+   handler is post-execution and side-effect-free, which is fine.
+4. **Cancel latency.**  `query.interrupt()` waits for the SDK's current
+   tool handler to complete.
+5. **Fork/compact loses model history.**  Tear-down-and-respawn for v1.
+   SDK's `forkSession + resumeSessionAt` could preserve history; deferred.
+6. **Unknown SDK tool emits would crash pi.**  We rely on
+   `tools: [...SUPPORTED_CC_TOOL_NAMES]` in SDK opts to constrain the
+   model.  If the SDK ever emits a tool not in that list (e.g. via skill
+   activation), pi fails with `Tool <name> not found`.  Adding a
+   defensive catch-all stub in event-bridge could mitigate.
 
-## Architecture (after fix)
+## Failed approaches (preserved for context)
 
-```
-streamSimple call from pi
-  ↓
-piToTranscript(context.messages, opts)
-  ↓                                   ┌──────────────────────────────────┐
-  ├─→ historic JSONL entries:         │  - All pi messages strictly      │
-  │      [user1, asst1, …,            │    before the last user-side run │
-  │       user_tool_result1,          │  - PLUS trailing tool_results    │
-  │       …,                          │    that pair with the last       │
-  │       SYNTH_ASSISTANT_MARKER]     │    historic assistant's tool_use │
-  │                                   │  - PLUS one synth_asst marker    │
-  │                                   └──────────────────────────────────┘
-  └─→ newUserContent:
-         User-side blocks (text from pi, OR tool_results that DON'T
-         pair with any historic assistant tool_use — usually empty
-         for tool-result-only continuation turns).
+### 1. Pre-Option-A: per-turn `query()` + transcript synthesis
 
-SessionStore.load(key) returns the historic entries.
-SDK materializes them to a temp jsonl.
-Subprocess loads, runs normalizer: orphan-prune skipped (all tool_uses
-paired), Xg5 sees synth_asst as last → no injection.
-```
+Spawned a fresh `query()` per turn with `--resume`, fed a synthesized
+JSONL transcript via `SessionStore.load()`.  The bundled binary's resume
+normalizer (`gG8 → iO6 → Xg5`) repeatedly injected synthetic
+`"Continue from where you left off."` / `"No response requested."`
+messages, producing "Picking up where I left off…" model output.
 
-## Key non-obvious choices
+Worked after the synth-asst-marker fix (commit `9e784f2`, `9433cc3`,
+`1ebc00f`) but was fragile — depended on the exact internal sentinels
+of a minified CC binary that could shift on any update.  Replaced by
+Option A.
 
-### Why split historic vs new prompt differently from before
+### 2. Option A: long-lived query() + SDK runs tools + pi just displays
 
-The original `piToTranscript` split was: "everything up to last assistant in historic; everything after in new prompt." The new split: "everything up to last assistant PLUS trailing tool_results that pair with the last assistant's tool_use in historic; everything else (typically empty for tool-result-only turns) in new prompt."
+The first long-lived-query architecture (commit `a59ed68`).  Assumed pi
+would just *display* tool calls without executing them.  This was the
+wrong assumption — pi's agent loop unconditionally executes any toolCall
+in an assistant message.  Discovered when pi started raising `Tool Bash
+not found`.  Replaced by the current stream-aligned-segmentation +
+stub-tools design.
 
-This ensures every assistant tool_use on disk has its matching tool_result on disk → `iO6` doesn't orphan-prune the assistant turn.
+### 3. `canUseTool: deny+interrupt` to stop SDK tool execution
 
-### Why "No response requested." specifically as the synth marker text
+Explored as a way to keep Option A's long-lived query but have pi
+actually run the tools.  The SDK records every canUseTool denial as a
+synthetic `is_error` tool_result in its session JSONL (sdk.d.ts:3242).
+On subsequent API calls, the request would include both that synthetic
+denial AND any tool_result we inject — same `tool_use_id` duplicated,
+which Anthropic API rejects, and the model is confused either way.
+Documented as not viable in the Conversation, not implemented.
 
-That exact string is the binary's own `TGH` constant. The binary synthesizes this text when it spliced its own placeholder assistant turn during interrupted-CLI recovery. By using the same wording, we're mimicking the binary's own output — the model has presumably seen this pattern in training data.
+### 4. `PreToolUse` hook denial
 
-### Why `model: "<synthetic>"` specifically
+Earlier probe (pre-Option-A, see progress_log.md) showed the PreToolUse
+hook fires reliably (unlike canUseTool), but its denial mechanism has
+the same duplicate `tool_use_id` problem on the next API call.
 
-That's the binary's `jG` constant. Various filters in the binary (e.g. `A7K`, `sR8`) treat assistant messages with `model === "<synthetic>"` differently — they don't count toward usage tracking, they get filtered from certain views, etc. By matching this convention, our marker plays nicely with the binary's existing logic.
+## Open paths
 
-### Why we don't need to defang pi's compaction prefix
-
-The earlier reverted commit `6e80c9e` defanged pi's `COMPACTION_SUMMARY_PREFIX`. That's a different bug — model says "Picking back up…" even on text-only conversations when compaction was used, because the compaction summary prefix is byte-identical to Claude Code's own compaction prefix and Opus recognizes it as a resume signal. The synth-asst marker doesn't address that compaction case — it would still need a separate fix if it becomes a priority. For now it's lower priority than the tool-use orphan injection.
-
-## Architecture: empty-prompt handling (`CONTINUATION_HINT`)
-
-The synth-asst marker fix has one subtle interaction with pi's per-turn model.
-When pi runs a tool and then calls `streamSimple` again to get the model's
-reflection, pi-cas's new `piToTranscript` folds the tool_result into the
-historic transcript and leaves `newUserContent` empty.
-
-If we then yield empty content via `promptGen`, the bundled binary substitutes
-its `(no content)` placeholder.  The model sees the synth-marker assistant
-saying "No response requested." followed by user "(no content)" and concludes
-the conversation is over, replying with generic acknowledgements like "I'm
-here if you need anything else" — NOT addressing the tool_result above.
-
-Fix: in `src/provider.ts`, when `newUserContent.length === 0`, `promptGen`
-yields the constant `CONTINUATION_HINT = "Continue based on the tool result
-above."` instead.  Empirically verified during E2E probes — the model now
-produces the expected contextual response.
-
-The hint is yielded via `promptGen` only and is NOT persisted into pi's
-history (pi-cas stores only the assistant's response, not the prompt it
-yielded), so users never see it.
-
-## Current status
-
-- **Investigation**: complete.
-- **Fix implementation**: committed (commit `9e784f2` and a follow-up
-  with reviewer-feedback fixes).
-- **Tests**: 73 tests pass, typecheck clean.
-- **E2E validation**: `/tmp/pi-cas-resume-probe/probe-e2e-scenarios.mjs`
-  passes all 5 scenarios (tool-result-only continuation, user follow-up,
-  pure text, first turn, multi-step tool sequence).
-- **Reviewer feedback addressed**: duplicate-`toolCallId` pairing bug fixed,
-  `CONTINUATION_HINT` hoisted to module scope, stale comment removed,
-  test coverage expanded (unpaired toolResult, duplicate id, isError).
-- **Pre-existing issues flagged but not in scope** for this fix:
-  - README claims about `canUseTool: deny` keeping the SDK from running
-    tools (contradicted by probe findings; pi-cas's production already has
-    the SDK auto-running tools and pi double-executing).
-  - Pi compaction-summary prefix bug (separate code path; previously
-    fixed in `6e80c9e` and reverted in `e43b124`).
-  - Custom pi tools not exposed to the SDK (v0.2 plan per README).
-
-See `writeups/progress_log.md` for chronological notes and the canUseTool
-investigation details.
-See `writeups/continuation_context.md` for handoff context.
-
-## Failed approaches and dead ends
-
-- **`hook_deferred_tool` attachment** (documented `dG8` escape): empirically does NOT fire in SDK resume path; cause unknown without deeper binary debugging.
-- **Long-lived `query()` + `canUseTool: deny+interrupt`** (Option B as originally designed): SDK supports the long-lived pattern, but `canUseTool` doesn't fire for tools the binary's internal auto-classifier short-circuits as benign. Confirmed across permissionMode variants AND with a clean CLAUDE_CONFIG_DIR.
-- **`settingSources: []` + inline empty settings**: doesn't suppress the auto-classifier.
-- **`tools: [Bash]` + `allowedTools: []`**: tool available without auto-allow, but auto-classifier still bypasses canUseTool.
-- **`permissionMode` variants** (`default`/`acceptEdits`/`plan`/`dontAsk`): none route through canUseTool for benign Bash.
-- **`PreToolUse` hook with `permissionDecision: "deny"`**: hook DOES fire and DOES block, but yielding the real tool_result afterward via the SDK's prompt gen creates a duplicate `tool_use_id` (the binary already paired the hook's synthetic deny as a tool_result), which the Anthropic API rejects.
-- **`PreToolUse` hook with `permissionDecision: "defer"`**: model retries the tool 3 times then gives up with `stop_reason: tool_deferred` — undesirable retry behavior.
-- **Defang compaction prefix**: a different fix for a different bug (`6e80c9e`, reverted in `e43b124`); not addressed here.
+1. **Pi permission UI.**  Add a `can_use_tool` control_request handler
+   that forwards to pi's notification/confirm UI; make `default`
+   permissionMode usable.
+2. **Pi custom tools via MCP.**  Mirror pi's registered tools into an
+   in-process MCP server so the model can call them.  Would let pi
+   extensions add their own model-visible tools.
+3. **Fork-with-history.**  Wire SDK's `forkSession + resumeSessionAt`
+   into the `session_before_fork` handler.  Already validated at the SDK
+   level by the earlier `probe-sdk-runs-fork.mjs`.
+4. **Defensive catch-all stub.**  Register a fallback `*` tool (if pi
+   supports it) so unknown CC tool names degrade gracefully instead of
+   crashing pi.
+5. **Tool argument modification via pre-execution hooks.**  Currently
+   pi's `tool_call` extension event has no effect on the SDK's actual
+   execution.  Wiring this would require canUseTool + JSON-edit
+   semantics — not free.

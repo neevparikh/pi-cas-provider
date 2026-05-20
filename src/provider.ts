@@ -855,7 +855,7 @@ function buildSubprocessEnv(
  * prompt iterator (`real`), skip the enqueue and just consume the next SDK
  * segment (`phantom`), or push an empty `done` (`empty`).
  */
-interface NewContentClassification {
+export interface NewContentClassification {
   kind: "real" | "phantom" | "empty";
   /** Anthropic-shaped user content blocks to enqueue (only populated for
    * `real`).  Excludes any toolResult-derived blocks: the SDK doesn't want
@@ -883,7 +883,7 @@ interface NewContentClassification {
  *   - Mixed real + phantom: treated as `real`; phantom toolResults are
  *     dropped (SDK already has them).
  */
-function classifyNewContent(
+export function classifyNewContent(
   messages: ReadonlyArray<any>,
   fromIndex: number,
   recentlyEmittedIds: ReadonlySet<string>,
