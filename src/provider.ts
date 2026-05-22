@@ -420,10 +420,18 @@ export function registerProvider(pi: ExtensionAPI): void {
 
   registerSlashCommands(pi, config, badge);
 
+  // Propagate `thinkingLevelMap` from the upstream model defs (e.g.
+  // `{ "xhigh": "xhigh" }` for claude-opus-4-7). Without this field pi's
+  // `setThinkingLevel` clamps requested levels against a default
+  // [low,medium,high] set and silently downgrades anything higher —
+  // pirouette's footer ends up showing "xhigh" on the persisted
+  // (clamped-before) side and "high" on the live-session side. See
+  // pi-hawk-provider commit 5b75551 for the same fix.
   const models = getModels("anthropic").map((m) => ({
     id: m.id,
     name: m.name,
     reasoning: m.reasoning,
+    ...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
     input: m.input,
     cost: m.cost,
     contextWindow: m.contextWindow,
