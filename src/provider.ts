@@ -101,6 +101,7 @@ import {
   SUPPORTED_CC_TOOL_NAMES,
 } from "./stub-tools.js";
 import { createTaskStub, TASK_TOOL_NAME } from "./task-stub.js";
+import { createAutoTurnStub, AUTO_TURN_TOOL_NAME } from "./auto-turn-stub.js";
 import { handleCanUseTool } from "./interactive-tools.js";
 import {
   type ProviderConfig,
@@ -147,6 +148,14 @@ interface PiSession {
    */
   iter: AsyncIterator<any>;
   /**
+   * In-flight `iter.next()` promise that the previous drain operation
+   * started but didn't consume (because it timed out waiting for an
+   * event).  Reused by the next read so we don't lose events.  Cleared
+   * once consumed.  See `drainPendingAutoTriggers` and the main consume
+   * loop.
+   */
+  pendingIterPromise: Promise<IteratorResult<any>> | undefined;
+  /**
    * Persistent event bridge that consumes SDK events and emits pi events
    * in segment-aligned chunks (one pi `done` per SDK assistant message).
    * Created once per pi session and reused across every streamSimple call.
@@ -159,6 +168,15 @@ interface PiSession {
    * forward them to the SDK as new user content.
    */
   recentlyEmittedToolUseIds: Set<string>;
+  /**
+   * Tool-use ids the bridge SYNTHESISED into the most recently closed
+   * segment (for auto-turn injection — see `auto-turn-stub.ts`).  The
+   * provider uses these so `classifyNewContent` can recognise the
+   * resulting tool_result messages as "synthetic phantoms" (drop them
+   * entirely; don't expect the SDK to produce more for them, since the
+   * SDK never knew about these tool calls).
+   */
+  recentlySyntheticToolUseIds: Set<string>;
   /** FIFO queue of pending user messages to yield into the AsyncIterable. */
   promptQueue: Array<{ content: any; resolved: () => void; failed: (e: any) => void }>;
   /** Resolver for the awaitable inside the prompt-gen loop. */
@@ -315,11 +333,20 @@ export function registerProvider(pi: ExtensionAPI): void {
   const taskStub = createTaskStub();
   pi.registerTool(taskStub);
   registeredStubNames.add(taskStub.name);
+  // Register the AutoTurn stub.  This stub is NEVER invoked by the model —
+  // pi-cas's event bridge synthesises tool_use blocks for it when it
+  // absorbs auto-triggered turns (Monitor stdout, backgrounded Bash
+  // completion, etc.) and injects them into the next user-response
+  // assistant message.  See `src/auto-turn-stub.ts` for the renderer.
+  const autoTurnStub = createAutoTurnStub();
+  pi.registerTool(autoTurnStub);
+  registeredStubNames.add(autoTurnStub.name);
   if (DEBUG) {
     console.error(
       `[pi-cas/debug] registered ${SUPPORTED_CC_TOOL_NAMES.length} stub tools: ` +
         SUPPORTED_CC_TOOL_NAMES.join(", ") +
-        `, plus ${TASK_TOOL_NAME} (rich renderer)`,
+        `, plus ${TASK_TOOL_NAME} (rich renderer), plus ${AUTO_TURN_TOOL_NAME} ` +
+        `(synthetic auto-turn renderer)`,
     );
   }
 
@@ -597,6 +624,83 @@ function registerLifecycleHooks(pi: ExtensionAPI, config: ProviderConfig): void 
 /**
  * Cleanly tear down a long-lived SDK query.  Best-effort: never throws.
  */
+/**
+ * Drain auto-trigger turns from the SDK iter until iter goes "quiet"
+ * (no events available within `timeoutMs`).
+ *
+ * # Why we need this
+ *
+ * The bridge's state-machine classifier (auto_triggered vs user_response)
+ * keys off whether `sdkState` was "idle" at push time.  But pi-cas only
+ * reads from iter inside `streamSimple`'s consume loop.  If notifications
+ * (Monitor stdout, backgrounded Bash completion, scheduled wakeup, etc.)
+ * fired during pi's idle period, the resulting auto-trigger turns are
+ * QUEUED in iter but the bridge hasn't observed them yet.  At push time,
+ * the bridge's `sdkState` is stale ("idle" because last thing it saw was
+ * a result event), and the bridge would incorrectly claim the first
+ * post-push iter event (which is actually the first buffered auto-
+ * trigger's status=requesting) as the user-response turn.
+ *
+ * To fix this: BEFORE notePush, drain everything that's already buffered.
+ * No push is pending during the drain, so every turn the bridge processes
+ * gets classified as auto_triggered (buffered, not pushed to pi stream).
+ * After the drain, the bridge's view is consistent with iter, and the
+ * post-push turn classification works correctly.
+ *
+ * # Timeout-based "quiet" detection
+ *
+ * We race `iter.next()` against a `setTimeout`.  If iter resolves first,
+ * we have an event — process it and loop.  If timeout fires first, we
+ * assume iter is quiet (no buffered events).  We stash the in-flight
+ * iter.next() promise on the session so the next read (in the consume
+ * loop or a subsequent drain) doesn't lose its eventual value.
+ *
+ * `timeoutMs` of ~100-200ms is a good balance: long enough to not race
+ * with normal API latency for buffered events (which the SDK delivers
+ * synchronously once we read), short enough to add negligible UX latency.
+ */
+async function drainPendingAutoTriggers(
+  session: PiSession,
+  timeoutMs: number,
+): Promise<void> {
+  const TIMEOUT_SENTINEL = Symbol("drain-timeout");
+  let drained = 0;
+  let drainStart = Date.now();
+  while (true) {
+    if (!session.pendingIterPromise) {
+      session.pendingIterPromise = session.iter.next();
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+      timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), timeoutMs);
+    });
+    const result = await Promise.race([
+      session.pendingIterPromise,
+      timeoutPromise,
+    ]);
+    if (timer) clearTimeout(timer);
+    if (result === TIMEOUT_SENTINEL) {
+      // Iter is quiet — leave pendingIterPromise in flight for next read.
+      if (DEBUG && drained > 0) {
+        console.error(
+          `[pi-cas/debug] drain done: ${drained} event(s) in ${Date.now() - drainStart}ms`,
+        );
+      }
+      return;
+    }
+    // We got an iter event.  Clear pending slot and process.
+    session.pendingIterPromise = undefined;
+    if (result.done) {
+      if (DEBUG) {
+        console.error(`[pi-cas/debug] drain: iter ended unexpectedly`);
+      }
+      return;
+    }
+    session.bridge.handle(result.value);
+    drained++;
+  }
+}
+
 async function teardownSession(session: PiSession, reason: string): Promise<void> {
   if (session.ended) return;
   session.ended = true;
@@ -708,6 +812,7 @@ function streamViaSDK(
       context.messages,
       session.lastSentCount,
       session.recentlyEmittedToolUseIds,
+      session.recentlySyntheticToolUseIds,
     );
     session.lastSentCount = context.messages.length;
 
@@ -716,6 +821,7 @@ function streamViaSDK(
         `[pi-cas/debug] classify: kind=${classification.kind} ` +
           `realBlocks=${classification.realUserBlocks.length} ` +
           `phantomIds=${classification.phantomToolResultIds.length} ` +
+          `syntheticPhantomIds=${classification.syntheticPhantomToolResultIds.length} ` +
           `unexpectedIds=${classification.unexpectedToolResultIds.length}`,
       );
     }
@@ -761,6 +867,17 @@ function streamViaSDK(
 
     let enqueuePromise: Promise<void> | undefined;
     if (classification.kind === "real") {
+      // BEFORE pushing: drain any auto-trigger turns that were buffered
+      // in iter from notifications fired during pi's idle time.  Each
+      // drained turn gets classified as auto_triggered by the bridge
+      // (push queue empty at status=requesting time) and absorbed into
+      // bufferedAutoTurns.  After draining, our notePush correctly marks
+      // sdkState=idle (drain ended on a result + no more events), so the
+      // NEXT turn from iter (which is the user-response) is classified
+      // correctly.  See `drainPendingAutoTriggers` for the timeout-based
+      // "iter is quiet" detection.
+      await drainPendingAutoTriggers(session, 150);
+
       enqueuePromise = new Promise<void>((resolve, reject) => {
         session.promptQueue.push({
           content: classification.realUserBlocks,
@@ -773,6 +890,11 @@ function streamViaSDK(
           w();
         }
       });
+      // Tell the bridge a push just happened.  The bridge uses this to
+      // discriminate the SDK turn that's responding to this push from
+      // auto-triggered turns that may still be in iter.  See
+      // `event-bridge.ts:noteStatusRequesting`.
+      session.bridge.notePush(Date.now());
     }
     // If kind === "phantom", we just consume more SDK events with no enqueue.
     // The SDK is mid-turn (between assistant messages, internally running
@@ -797,7 +919,11 @@ function streamViaSDK(
       // (message_stop + all tool_results paired) OR the turn ends without
       // any segment (empty/error turn).
       while (!session.bridge.isSegmentReady() && !session.bridge.isTurnDone()) {
-        const next = await session.iter.next();
+        // Use pendingIterPromise if the drain left an in-flight read.
+        const iterPromise =
+          session.pendingIterPromise ?? session.iter.next();
+        session.pendingIterPromise = undefined;
+        const next = await iterPromise;
         if (next.done) {
           if (DEBUG) console.error(`[pi-cas/debug] iter exhausted unexpectedly`);
           break;
@@ -860,11 +986,17 @@ function streamViaSDK(
 
       // Capture the segment's tool-use ids BEFORE closing (closeSegment
       // resets per-segment state).  These become the "phantom" set for
-      // the next streamSimple.
+      // the next streamSimple.  Synthetic ids (auto-turn injections, see
+      // `auto-turn-stub.ts`) are tracked separately so classifyNewContent
+      // can drop them entirely rather than wait for the SDK to do
+      // something with them.
       const segmentToolUseIds = session.bridge.getCurrentSegmentToolUseIds();
+      const segmentSyntheticToolUseIds =
+        session.bridge.getSyntheticToolUseIdsForCurrentSegment();
       const segmentStopReason = session.bridge.getSegmentStopReason();
       session.bridge.closeSegment();
       session.recentlyEmittedToolUseIds = new Set(segmentToolUseIds);
+      session.recentlySyntheticToolUseIds = new Set(segmentSyntheticToolUseIds);
 
       // If the segment closed at end_turn / length (not toolUse), the SDK
       // will emit `result` next.  Drain it off the iterator so it doesn't
@@ -1129,6 +1261,8 @@ async function ensureSession(
       onUnknownToolName: (name) => config.registerDynamicStub?.(name),
     }),
     recentlyEmittedToolUseIds: new Set(),
+    recentlySyntheticToolUseIds: new Set(),
+    pendingIterPromise: undefined,
     promptQueue,
     genWaker: null,
     ended: false,
@@ -1285,6 +1419,11 @@ export interface NewContentClassification {
    * recently-emitted set — i.e. the expected phantoms from pi running our
    * stub tools. */
   phantomToolResultIds: string[];
+  /** ToolResult message ids whose toolCallId matched our SYNTHETIC
+   * recently-emitted set (auto-turn stubs we injected, see
+   * `auto-turn-stub.ts`).  These are silently dropped — the SDK never
+   * knew about these tool calls, so there's nothing to wait for. */
+  syntheticPhantomToolResultIds: string[];
   /** ToolResult message ids in the slice that DIDN'T match our recent set.
    * Logged as a warning; might indicate a pi extension feeding us tool
    * results we don't expect, or a stale `lastSentCount`. */
@@ -1306,10 +1445,25 @@ export function classifyNewContent(
   messages: ReadonlyArray<any>,
   fromIndex: number,
   recentlyEmittedIds: ReadonlySet<string>,
+  syntheticIds: ReadonlySet<string> = new Set(),
 ): NewContentClassification {
   const realUserBlocks: any[] = [];
   const phantomToolResultIds: string[] = [];
+  const syntheticPhantomToolResultIds: string[] = [];
   const unexpectedToolResultIds: string[] = [];
+
+  const classifyId = (id: string) => {
+    // Synthetic check FIRST: a synthetic id should always be classified
+    // as such even if it also happened to leak into the real-emitted
+    // set (defensive — shouldn't happen in normal flow).
+    if (syntheticIds.has(id)) {
+      syntheticPhantomToolResultIds.push(id);
+    } else if (recentlyEmittedIds.has(id)) {
+      phantomToolResultIds.push(id);
+    } else {
+      unexpectedToolResultIds.push(id);
+    }
+  };
 
   for (let i = fromIndex; i < messages.length; i++) {
     const m = messages[i];
@@ -1319,13 +1473,7 @@ export function classifyNewContent(
       // Pi's top-level toolResult message shape (see pi-ai types.d.ts:203).
       // The toolCallId tells us whether it's one of ours.
       const id = m.toolCallId;
-      if (typeof id === "string") {
-        if (recentlyEmittedIds.has(id)) {
-          phantomToolResultIds.push(id);
-        } else {
-          unexpectedToolResultIds.push(id);
-        }
-      }
+      if (typeof id === "string") classifyId(id);
       continue;
     }
 
@@ -1337,13 +1485,7 @@ export function classifyNewContent(
           // messages (skip, account for phantom).
           if (block?.type === "toolResult" || block?.type === "tool_result") {
             const id = block.toolCallId ?? block.tool_use_id;
-            if (typeof id === "string") {
-              if (recentlyEmittedIds.has(id)) {
-                phantomToolResultIds.push(id);
-              } else {
-                unexpectedToolResultIds.push(id);
-              }
-            }
+            if (typeof id === "string") classifyId(id);
             continue;
           }
           const translated = piBlockToAnthropic(block);
@@ -1363,12 +1505,22 @@ export function classifyNewContent(
   if (realUserBlocks.length > 0) {
     kind = "real";
   } else if (phantomToolResultIds.length > 0) {
+    // Real phantoms: SDK is mid-turn with pending tool_results, will emit
+    // the next assistant message.  Consume loop reads next iter event.
     kind = "phantom";
   } else {
+    // Either nothing, or only synthetic phantoms.  Either way, the SDK
+    // has nothing pending — push empty done and return.
     kind = "empty";
   }
 
-  return { kind, realUserBlocks, phantomToolResultIds, unexpectedToolResultIds };
+  return {
+    kind,
+    realUserBlocks,
+    phantomToolResultIds,
+    syntheticPhantomToolResultIds,
+    unexpectedToolResultIds,
+  };
 }
 
 /**

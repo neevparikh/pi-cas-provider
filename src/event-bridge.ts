@@ -57,6 +57,11 @@ import { PROVIDER_ID } from "./config.js";
 import { put as cacheToolResult, type CachedToolResult } from "./tool-result-cache.js";
 import { isSupportedStubTool } from "./stub-tools.js";
 import {
+  AUTO_TURN_TOOL_NAME,
+  type AutoTurnBlock,
+  type AutoTurnDetails,
+} from "./auto-turn-stub.js";
+import {
   appendAssistant as transcriptAppendAssistant,
   appendToolResult as transcriptAppendToolResult,
   markFinished as transcriptMarkFinished,
@@ -66,6 +71,27 @@ import {
 } from "./subagent-transcript.js";
 
 const DEBUG = process.env.PI_CAS_DEBUG === "1";
+
+/**
+ * Targeted timing diagnostic for "assistant text didn't render until <X>"
+ * investigations — covers AskUserQuestion (text + tool_use(AskUserQuestion)
+ * + waiting on user) and Monitor (text + tool_use(Monitor) + waiting on
+ * tool_result that may be delayed if the SDK holds it until first stdout
+ * line / monitor exit).  Gated by its own env var so it doesn't spam normal
+ * DEBUG sessions with per-text-block logs.
+ *
+ * Enable via: PI_CAS_SEGMENT_TIMING=1
+ *
+ * Logs are wall-clock ms (process-uptime-relative) so they line up with the
+ * matching logs in `interactive-tools.ts` (same `T0`).
+ */
+const TIMING_DEBUG = process.env.PI_CAS_SEGMENT_TIMING === "1";
+const TIMING_T0 = Date.now();
+function tlog(msg: string): void {
+  if (!TIMING_DEBUG) return;
+  const t = String(Date.now() - TIMING_T0).padStart(7);
+  console.error(`[pi-cas/timing][bridge ] +${t}ms ${msg}`);
+}
 
 /** Tracked content block within the current segment. */
 interface Tracked {
@@ -79,6 +105,75 @@ interface Tracked {
   /** Original CC tool name for tool_use blocks. */
   toolName?: string;
 }
+
+/* -------------------- auto-turn detection state machine -------------------- */
+
+/**
+ * SDK lifecycle phase, tracked via `system.status`, `message_start`, and
+ * `result` events.  Used to discriminate auto-triggered turns (model
+ * responses to task-notifications injected by Monitor/background-Bash/etc.)
+ * from user-input-response turns.  See `writeups/monitor_desync.md`.
+ */
+type SdkState = "idle" | "api_requesting" | "in_turn";
+
+/**
+ * One user prompt the provider has pushed into the SDK's promptQueue.
+ * The bridge uses these to decide whether a new turn is "for" a push or
+ * is an auto-trigger.  Discriminator (in `noteNewTurnStarting`):
+ *   - push at head exists AND (push was made while sdkState was idle, OR
+ *     push.pushTime < lastResultTime) → next turn is the response. Pop head.
+ *   - otherwise → next turn is auto-triggered.
+ */
+interface PendingPush {
+  pushTime: number;
+  wasIdleAtPushTime: boolean;
+}
+
+/**
+ * One captured `system.task_notification` event, retained briefly so the
+ * bridge can correlate it with the auto-trigger that follows.  We use the
+ * correlation to populate `AutoTurnDetails.trigger` for the renderer (so
+ * the user sees e.g. "AutoTurn (Bash) — bg-probe-test completed").
+ */
+interface PendingTaskNotification {
+  time: number;
+  toolUseId?: string;
+  toolName?: string;
+  status?: string;
+  summary?: string;
+  outputFile?: string;
+}
+
+/** An auto-turn whose events we've absorbed instead of streaming to pi.
+ * Held until the next user-response turn message_start, when the bridge
+ * synthesises a `__pi_cas_auto_turn` tool_use into pi's output and caches
+ * the absorbed content as that tool's result. */
+interface BufferedAutoTurn {
+  blocks: AutoTurnBlock[];
+  trigger?: AutoTurnDetails["trigger"];
+  usage?: AutoTurnDetails["usage"];
+  isError?: boolean;
+}
+
+/** Per-Anthropic-message tracking inside an auto-turn.  Reset on each
+ * message_start within the auto-turn (turns may contain multiple
+ * assistant messages, e.g. text → tool_use → tool_result → text).
+ * Resolves on content_block_stop to push a finished block into
+ * `currentAutoTurn.blocks`. */
+interface AutoTurnTracked {
+  index: number;
+  kind: "text" | "thinking" | "tool_use";
+  text?: string;           // for text/thinking accumulator
+  partialJson?: string;    // for tool_use json args accumulator
+  toolUseId?: string;
+  toolName?: string;
+}
+
+/** Max age of a task_notification we still consider "fresh enough" to
+ * correlate with an arriving auto-trigger.  Empirically ~10ms between
+ * the notification system event and the matching status=requesting in
+ * the bg-bash probe; 2s is generous. */
+const NOTIFICATION_CORRELATION_WINDOW_MS = 2000;
 
 /** Stop reason mapped to pi's vocabulary. */
 type PiStopReason = AssistantMessage["stopReason"];
@@ -154,6 +249,23 @@ export interface EventBridge {
 
   /** Session-scoped: total cost across this turn (and beyond — accumulating). */
   getCost(): number | undefined;
+
+  /* -------------------- auto-turn detection API -------------------- */
+
+  /** Notify the bridge that the provider has just pushed a new user
+   * prompt into the SDK's promptQueue.  The bridge uses this to
+   * discriminate the SDK turn that responds to this push from auto-
+   * triggered turns (from Monitor / backgrounded Bash / etc.) that may
+   * be already buffered in the SDK iter.  Call this AFTER enqueuing into
+   * promptQueue, with `Date.now()` or equivalent. */
+  notePush(pushTime: number): void;
+
+  /** Synthetic tool_use_ids the bridge has injected during the most
+   * recent closed segment.  Provider adds these to its phantom-detection
+   * set so the resulting toolResult messages from pi don't get
+   * misclassified.  Cleared on closeSegment alongside
+   * `getCurrentSegmentToolUseIds`. */
+  getSyntheticToolUseIdsForCurrentSegment(): string[];
 }
 
 /**
@@ -197,6 +309,52 @@ export function createEventBridge(
   let cost: number | undefined;
   let turnError: string | undefined;
 
+  // --- auto-turn detection state (cross-segment, cross-turn) ---
+  //
+  // Tracks the SDK's lifecycle so we can discriminate auto-triggered
+  // turns (model auto-runs on task-notifications from Monitor/bg-Bash/etc.)
+  // from user-response turns.  Updated by `noteStatusRequesting`,
+  // `noteMessageStart`, and `noteResult` inside the existing event handlers.
+  let sdkState: SdkState = "idle";
+  let lastResultTime = 0;
+  const pushQueue: PendingPush[] = [];
+  let currentTurnKind: "user_response" | "auto_triggered" | "unknown" = "unknown";
+  const recentTaskNotifications: PendingTaskNotification[] = [];
+
+  // Auto-turn buffering (cross-segment).  When `currentTurnKind ===
+  // "auto_triggered"`, content blocks and tool_results are collected
+  // into `currentAutoTurn` instead of being pushed to pi's stream.
+  // On the turn-ending `result`, currentAutoTurn moves into
+  // `bufferedAutoTurns`.  On the next user-response message_start, the
+  // bridge synthesises a `__pi_cas_auto_turn` tool_use per buffered turn,
+  // pre-populates the tool-result-cache, and pushes synthetic toolcall
+  // events to pi's stream BEFORE forwarding the real response's content.
+  let currentAutoTurn: BufferedAutoTurn | null = null;
+  const bufferedAutoTurns: BufferedAutoTurn[] = [];
+  // Persistent map from tool_use_id → tool name, populated whenever the
+  // bridge sees ANY tool_use block (main-thread, auto-turn, or
+  // subagent-leaked).  Used by `resolveToolNameById` to label auto-turn
+  // triggers with the originating tool's name even when that tool was
+  // called in a long-gone segment (e.g. Bash run_in_background's tool_use
+  // landed in segment #1; the completion notification correlates with
+  // a synthetic injected into segment #3).  Bounded growth in practice
+  // (one entry per tool_use the SDK emits in this session); not worth
+  // explicit eviction yet.
+  const toolUseIdToName = new Map<string, string>();
+  // Per-Anthropic-message tracking inside the current auto-turn.  Reset
+  // on each message_start within the auto-turn; resolved on
+  // content_block_stop to push the finished block into currentAutoTurn.
+  let autoTurnTracked: AutoTurnTracked[] = [];
+  // Synthetic tool_use_ids injected during the in-progress segment.
+  // Captured by the provider via `getSyntheticToolUseIdsForCurrentSegment`
+  // when the segment closes (mirrors `segmentToolUseIds`).
+  let segmentSyntheticToolUseIds: string[] = [];
+  let nextSyntheticIdCounter = 0;
+  // Map auto-turn tool_use_id (real, from SDK) → which BufferedAutoTurn
+  // it belongs to.  Used so that `ingestToolResult` knows to append the
+  // result to the auto-turn's blocks (not pi's main stream).
+  const autoTurnIds = new Set<string>();
+
   // Per-segment state — reset on each new Anthropic message_start.
   let stream: AssistantMessageEventStream | undefined;
   let output: AssistantMessage = freshOutput(currentModel);
@@ -214,10 +372,263 @@ export function createEventBridge(
     blocks = [];
     pendingToolUseIds = new Set();
     segmentToolUseIds = [];
+    segmentSyntheticToolUseIds = [];
     sawMessageStop = false;
     sawAnyContentForSegment = false;
     segmentStarted = false;
     rawStopReason = undefined;
+  }
+
+  /* -------------------- auto-turn helpers -------------------- */
+
+  /** Called when we see a `system.status` event with status === "requesting".
+   * Classifies the upcoming turn as user_response (it's the model
+   * answering one of our pushed prompts) or auto_triggered (the SDK is
+   * auto-running the model on an internally-injected task-notification).
+   *
+   * The discriminator: do we have a queued push whose in-flight at-push-
+   * time activity has cleared by now?  If yes, this turn is its response.
+   * Otherwise the turn is auto-triggered.
+   *
+   * Only acts when sdkState transitions IDLE → API_REQUESTING (a NEW turn).
+   * Within-turn status=requesting events (e.g. SDK calls the model again
+   * after running a tool) are ignored — they don't start a new turn. */
+  function noteStatusRequesting(): void {
+    if (sdkState !== "idle") {
+      // Mid-turn re-request (e.g. SDK runs a tool then calls model again).
+      // Doesn't change kind.
+      return;
+    }
+    sdkState = "api_requesting";
+    // Pick the next claimable push.  A push is claimable if EITHER:
+    //   (a) wasIdleAtPushTime: the push hit when SDK was quiescent, so
+    //       the very next API call is for it; OR
+    //   (b) lastResultTime > pushTime: whatever was in-flight at push
+    //       time has now ended, so the next API call is for this push.
+    const head = pushQueue[0];
+    if (head && (head.wasIdleAtPushTime || head.pushTime < lastResultTime)) {
+      currentTurnKind = "user_response";
+      pushQueue.shift();
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] new turn classified user_response ` +
+            `(push at t=${head.pushTime}, lastResult=${lastResultTime})`,
+        );
+      }
+    } else {
+      currentTurnKind = "auto_triggered";
+      if (DEBUG) {
+        const reason = head
+          ? `head push at t=${head.pushTime} > lastResult=${lastResultTime}`
+          : "no pending push";
+        console.error(`[pi-cas/debug] new turn classified auto_triggered (${reason})`);
+      }
+      // Start collecting blocks for this auto-turn.
+      currentAutoTurn = {
+        blocks: [],
+        trigger: correlateNearestNotification(Date.now()),
+      };
+    }
+  }
+
+  /** Called from the result-event branch of `handle()`.  Always: marks
+   * sdkState=idle and updates lastResultTime.  If we were absorbing an
+   * auto-turn: flushes currentAutoTurn into bufferedAutoTurns. */
+  function noteResult(t: number, isError: boolean, usage: any): void {
+    lastResultTime = t;
+    sdkState = "idle";
+    if (currentTurnKind === "auto_triggered" && currentAutoTurn) {
+      currentAutoTurn.isError = isError;
+      if (usage) {
+        const u = currentAutoTurn.usage ?? {};
+        if (typeof usage.input_tokens === "number") u.input = usage.input_tokens;
+        if (typeof usage.output_tokens === "number") u.output = usage.output_tokens;
+        if (typeof usage.cache_read_input_tokens === "number")
+          u.cacheRead = usage.cache_read_input_tokens;
+        if (typeof usage.cache_creation_input_tokens === "number")
+          u.cacheWrite = usage.cache_creation_input_tokens;
+        u.totalTokens = (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+        currentAutoTurn.usage = u;
+      }
+      bufferedAutoTurns.push(currentAutoTurn);
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] auto-turn buffered (${currentAutoTurn.blocks.length} blocks, ` +
+            `isError=${isError}); total buffered=${bufferedAutoTurns.length}`,
+        );
+      }
+      currentAutoTurn = null;
+    }
+    currentTurnKind = "unknown";
+  }
+
+  /** Called on `system.task_notification` — store briefly so the next
+   * auto-trigger that fires can be labeled with the triggering tool. */
+  function noteTaskNotification(msg: any, t: number): void {
+    const toolUseId =
+      typeof msg.tool_use_id === "string" ? msg.tool_use_id : undefined;
+    const notif: PendingTaskNotification = {
+      time: t,
+      toolUseId,
+      toolName: toolUseId ? resolveToolNameById(toolUseId) : undefined,
+      status: typeof msg.status === "string" ? msg.status : undefined,
+      summary: typeof msg.summary === "string" ? msg.summary : undefined,
+      outputFile:
+        typeof msg.output_file === "string" ? msg.output_file : undefined,
+    };
+    recentTaskNotifications.push(notif);
+    // Trim ancient entries.  Anything older than 2× the correlation
+    // window can't possibly match a new auto-trigger.
+    const cutoff = t - NOTIFICATION_CORRELATION_WINDOW_MS * 2;
+    while (
+      recentTaskNotifications.length > 0 &&
+      recentTaskNotifications[0].time < cutoff
+    ) {
+      recentTaskNotifications.shift();
+    }
+  }
+
+  /** Resolve a tool_use_id to its tool name via the persistent
+   * `toolUseIdToName` map, populated whenever we see any tool_use block. */
+  function resolveToolNameById(id: string): string | undefined {
+    return toolUseIdToName.get(id);
+  }
+
+  /** Find a recent task_notification close in time to `now`, if any. */
+  function correlateNearestNotification(now: number): AutoTurnDetails["trigger"] | undefined {
+    // Prefer the most recent notification within the window.
+    for (let i = recentTaskNotifications.length - 1; i >= 0; i--) {
+      const n = recentTaskNotifications[i];
+      if (now - n.time <= NOTIFICATION_CORRELATION_WINDOW_MS) {
+        return {
+          toolUseId: n.toolUseId,
+          toolName: n.toolName,
+          status: n.status,
+          summary: n.summary,
+          outputFile: n.outputFile,
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /** Inject synthetic `__pi_cas_auto_turn` tool_use blocks at the start
+   * of the current user-response segment.  Pre-populates the tool-result-
+   * cache so pi's executor's later cache lookup succeeds.  Records the
+   * synthetic ids in `segmentSyntheticToolUseIds` for the provider to
+   * track as phantoms.
+   *
+   * Must be called AFTER `ensureStreamStarted` (so pi's stream is open)
+   * and BEFORE we forward the real assistant message's content_blocks. */
+  function injectBufferedAutoTurns(): void {
+    if (bufferedAutoTurns.length === 0) return;
+    if (!stream) return;
+
+    for (const turn of bufferedAutoTurns) {
+      const id = `pi-cas-auto-${sdkSessionId ?? "default"}-${nextSyntheticIdCounter++}`;
+      const piIndex = output.content.length;
+
+      // Build a short args object the renderer can show in renderCall.
+      const args: Record<string, unknown> = {
+        trigger_summary: turn.trigger?.summary,
+        trigger_tool_name: turn.trigger?.toolName,
+        block_count: turn.blocks.length,
+      };
+
+      // Append the toolCall to pi's view of output.content.
+      output.content.push({
+        type: "toolCall",
+        id,
+        name: AUTO_TURN_TOOL_NAME,
+        arguments: args,
+      } as ToolCall);
+      // Track in blocks[] so subsequent index lookups don't get confused.
+      // Use a synthetic ccIdx that can't collide with the SDK's (-1 etc.
+      // would technically work, but we use a large negative offset to make
+      // it obvious in debug logs).
+      const syntheticCcIdx = -1_000_000 - nextSyntheticIdCounter;
+      blocks.push({
+        index: syntheticCcIdx,
+        piIndex,
+        kind: "tool_use",
+        toolName: AUTO_TURN_TOOL_NAME,
+        partialJson: JSON.stringify(args),
+      });
+
+      // Pre-populate the cache with the absorbed content + AutoTurnDetails.
+      const details: AutoTurnDetails = {
+        _piCasIsError: turn.isError,
+        _piCasToolName: AUTO_TURN_TOOL_NAME,
+        trigger: turn.trigger,
+        blocks: turn.blocks,
+        usage: turn.usage,
+      };
+      // Cache entry's `content` field is what pi's stub's execute returns.
+      // Use a one-line summary so a no-renderResult fallback shows something
+      // reasonable; the rich view comes from `renderResult` reading details.
+      const summaryText = autoTurnSummaryText(turn);
+      const entry: CachedToolResult = {
+        content: [{ type: "text", text: summaryText }],
+        isError: Boolean(turn.isError),
+        toolName: AUTO_TURN_TOOL_NAME,
+        details,
+      };
+      cacheToolResult(id, entry);
+
+      // Push the synthetic stream events.
+      stream.push({ type: "toolcall_start", contentIndex: piIndex, partial: output });
+      stream.push({
+        type: "toolcall_delta",
+        contentIndex: piIndex,
+        delta: JSON.stringify(args),
+        partial: output,
+      });
+      stream.push({
+        type: "toolcall_end",
+        contentIndex: piIndex,
+        toolCall: output.content[piIndex] as ToolCall,
+        partial: output,
+      });
+
+      segmentSyntheticToolUseIds.push(id);
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] injected synthetic auto-turn tool_use id=${id.slice(-12)} ` +
+            `at piIndex=${piIndex} (${turn.blocks.length} blocks, ` +
+            `trigger=${turn.trigger?.toolName ?? "?"})`,
+        );
+      }
+    }
+    // Consumed — clear for the next streamSimple's segment.
+    bufferedAutoTurns.length = 0;
+  }
+
+  function autoTurnSummaryText(turn: BufferedAutoTurn): string {
+    const trig = turn.trigger;
+    const head = trig?.toolName
+      ? `AutoTurn (${trig.toolName}${trig.status ? `, ${trig.status}` : ""})`
+      : "AutoTurn (notification)";
+    const trailingText = (() => {
+      for (let i = turn.blocks.length - 1; i >= 0; i--) {
+        const b = turn.blocks[i];
+        if (b.kind === "text") return b.text.trim();
+        if (b.kind === "tool_use" || b.kind === "tool_result") return "";
+      }
+      return "";
+    })();
+    if (trailingText) {
+      const firstLine = trailingText.split("\n")[0]?.trim() ?? "";
+      const preview = firstLine.length > 120 ? `${firstLine.slice(0, 120)}...` : firstLine;
+      return `${head}\n${preview}`;
+    }
+    return head;
+  }
+
+  /** Append a content block to the current auto-turn buffer.  No-op if
+   * not currently absorbing. */
+  function appendBlockToAutoTurn(block: AutoTurnBlock): void {
+    if (!currentAutoTurn) return;
+    currentAutoTurn.blocks.push(block);
   }
 
   function ensureStreamStarted(): void {
@@ -347,6 +758,15 @@ export function createEventBridge(
             summary: typeof msg.summary === "string" ? msg.summary : undefined,
           });
         }
+        // Also record for auto-turn correlation (independent of subagent
+        // transcript path; both can coexist for the same notification).
+        noteTaskNotification(msg, Date.now());
+        return;
+      }
+      if (sub === "status" && msg.status === "requesting") {
+        // New API call beginning OR mid-turn re-request.  See
+        // `noteStatusRequesting` for state-machine logic.
+        noteStatusRequesting();
         return;
       }
       if (sub === "task_updated") {
@@ -374,6 +794,12 @@ export function createEventBridge(
     // accumulation; the `assistant` event is a no-op here except for the
     // diagnostic case where partials were absent.  See appendFinalBlock().
     if (msg.type === "assistant") {
+      // Auto-trigger mode: typed assistant event is the post-stream
+      // mirror; we already absorbed via stream_events.  Skip output.content
+      // mutation since auto-turns aren't pi-visible.
+      if (currentTurnKind === "auto_triggered") {
+        return;
+      }
       // If we somehow received no stream events for this message, fall back
       // to materializing content from the final message.  (Not expected with
       // `includePartialMessages: true`.)
@@ -404,7 +830,25 @@ export function createEventBridge(
         let first = true;
         for (const block of c) {
           if (block.type === "tool_result") {
-            ingestToolResult(block, first ? msg.tool_use_result : undefined);
+            if (currentTurnKind === "auto_triggered" && currentAutoTurn) {
+              // Route to auto-turn buffer; don't populate the main
+              // cache (pi never asks for these — auto-turn tool_uses
+              // aren't pi-visible).
+              const content = normalizeToolResultContent(block.content);
+              const textContent = content
+                .filter((c) => c.type === "text")
+                .map((c) => (c as any).text)
+                .join("\n");
+              appendBlockToAutoTurn({
+                kind: "tool_result",
+                tool_use_id: String(block.tool_use_id ?? ""),
+                content: textContent,
+                is_error: block.is_error === true,
+              });
+              autoTurnIds.add(String(block.tool_use_id ?? ""));
+            } else {
+              ingestToolResult(block, first ? msg.tool_use_result : undefined);
+            }
             first = false;
           }
         }
@@ -422,7 +866,27 @@ export function createEventBridge(
     if (msg.type === "result") {
       if (typeof msg.total_cost_usd === "number") cost = msg.total_cost_usd;
       if (msg.fast_mode_state) fastModeState = msg.fast_mode_state;
-      if (msg.usage) updateUsage(msg.usage);
+      // Capture turn classification BEFORE noteResult clears it.
+      const wasAutoTriggered = currentTurnKind === "auto_triggered";
+      // updateUsage targets `output.usage` (the user-visible segment).
+      // For auto-triggered turns, the usage goes onto the auto-turn buffer
+      // (handled inside noteResult).  Skip updateUsage when we're closing
+      // out an auto-turn so the user-visible segment's usage stays clean.
+      if (msg.usage && !wasAutoTriggered) updateUsage(msg.usage);
+      // noteResult: clears auto-turn state machine; if we were absorbing,
+      // flushes currentAutoTurn into bufferedAutoTurns.
+      noteResult(Date.now(), msg.is_error === true, msg.usage);
+      // DO NOT set turnDone for auto-trigger turns.  Provider's consume
+      // loop must keep running to observe the next turn (which might be
+      // another auto-trigger or the user-response turn).  turnDone fires
+      // only when the user-response (or unattributed) turn fully ends.
+      if (wasAutoTriggered) {
+        if (DEBUG) console.error(`[pi-cas/debug] auto-turn result; NOT setting turnDone`);
+        // Don't propagate error from auto-turn to turnError; user-response
+        // turn might still succeed.  (Operators can find auto-turn errors
+        // in the AutoTurnDetails.isError field.)
+        return;
+      }
       turnDone = true;
       if (msg.is_error === true) {
         // SDK signaled a turn-level error (auth failure, rate limit, server
@@ -446,6 +910,16 @@ export function createEventBridge(
   function handleSseEvent(event: any): void {
     switch (event.type) {
       case "message_start": {
+        // sdkState bookkeeping (regardless of turn kind):
+        sdkState = "in_turn";
+
+        // Auto-trigger mode: collect content into currentAutoTurn instead
+        // of streaming to pi.  Reset per-message tracking.
+        if (currentTurnKind === "auto_triggered") {
+          autoTurnTracked = [];
+          return;
+        }
+
         // Boundary: a new Anthropic assistant message begins.  If we were
         // mid-segment (which means provider hasn't called closeSegment yet)
         // this is a bug — but defensive: reset.
@@ -461,12 +935,39 @@ export function createEventBridge(
         ensureStreamStarted();
         sawAnyContentForSegment = true;
         if (event.message?.usage) updateUsage(event.message.usage);
+        // First Anthropic assistant message in a user-response turn?
+        // Inject buffered auto-turns right after `start` (which
+        // ensureStreamStarted just pushed).  See `injectBufferedAutoTurns`.
+        if (bufferedAutoTurns.length > 0) {
+          injectBufferedAutoTurns();
+        }
         // Tracked-block indices reset per message — already cleared by
         // resetSegment / fresh segment.
         return;
       }
 
       case "content_block_start": {
+        // Auto-trigger mode: track without streaming to pi.
+        if (currentTurnKind === "auto_triggered") {
+          const cb = event.content_block;
+          const ccIdx = event.index ?? 0;
+          if (cb.type === "text") {
+            autoTurnTracked.push({ index: ccIdx, kind: "text", text: "" });
+          } else if (cb.type === "thinking") {
+            autoTurnTracked.push({ index: ccIdx, kind: "thinking", text: "" });
+          } else if (cb.type === "tool_use") {
+            autoTurnTracked.push({
+              index: ccIdx,
+              kind: "tool_use",
+              partialJson: "",
+              toolUseId: cb.id,
+              toolName: cb.name,
+            });
+            toolUseIdToName.set(cb.id, cb.name);
+          }
+          return;
+        }
+
         sawAnyContentForSegment = true;
         ensureStreamStarted();
         const cb = event.content_block;
@@ -476,6 +977,7 @@ export function createEventBridge(
           output.content.push({ type: "text", text: "" } as TextContent);
           blocks.push({ index: ccIdx, piIndex, kind: "text" });
           stream?.push({ type: "text_start", contentIndex: piIndex, partial: output });
+          tlog(`pushed text_start    contentIndex=${piIndex} ccIdx=${ccIdx}`);
         } else if (cb.type === "thinking") {
           const piIndex = output.content.length;
           output.content.push({
@@ -527,12 +1029,32 @@ export function createEventBridge(
           });
           pendingToolUseIds.add(cb.id);
           segmentToolUseIds.push(cb.id);
+          toolUseIdToName.set(cb.id, cb.name);
           stream?.push({ type: "toolcall_start", contentIndex: piIndex, partial: output });
+          tlog(
+            `pushed toolcall_start contentIndex=${piIndex} ccIdx=${ccIdx} ` +
+              `name=${cb.name} id=${String(cb.id).slice(-8)}`,
+          );
         }
         return;
       }
 
       case "content_block_delta": {
+        // Auto-trigger mode: accumulate into autoTurnTracked instead.
+        if (currentTurnKind === "auto_triggered") {
+          const aut = autoTurnTracked.find((b) => b.index === event.index);
+          if (!aut) return;
+          const d = event.delta;
+          if (d.type === "text_delta" && aut.kind === "text") {
+            aut.text = (aut.text ?? "") + (d.text ?? "");
+          } else if (d.type === "thinking_delta" && aut.kind === "thinking") {
+            aut.text = (aut.text ?? "") + (d.thinking ?? "");
+          } else if (d.type === "input_json_delta" && aut.kind === "tool_use") {
+            aut.partialJson = (aut.partialJson ?? "") + (d.partial_json ?? "");
+          }
+          return;
+        }
+
         const tracked = blocks.find((b) => b.index === event.index);
         if (!tracked) return;
         const d = event.delta;
@@ -576,6 +1098,31 @@ export function createEventBridge(
       }
 
       case "content_block_stop": {
+        // Auto-trigger mode: finalize and append to currentAutoTurn.
+        if (currentTurnKind === "auto_triggered") {
+          const aut = autoTurnTracked.find((b) => b.index === event.index);
+          if (!aut) return;
+          if (aut.kind === "text") {
+            appendBlockToAutoTurn({ kind: "text", text: aut.text ?? "" });
+          } else if (aut.kind === "thinking") {
+            appendBlockToAutoTurn({ kind: "thinking", text: aut.text ?? "" });
+          } else if (aut.kind === "tool_use") {
+            let parsedArgs: Record<string, unknown> = {};
+            try {
+              parsedArgs = JSON.parse(aut.partialJson ?? "");
+            } catch {
+              /* keep empty */
+            }
+            appendBlockToAutoTurn({
+              kind: "tool_use",
+              id: aut.toolUseId ?? "",
+              name: aut.toolName ?? "?",
+              arguments: parsedArgs,
+            });
+          }
+          return;
+        }
+
         const tracked = blocks.find((b) => b.index === event.index);
         if (!tracked) return;
         if (tracked.kind === "text") {
@@ -586,6 +1133,10 @@ export function createEventBridge(
             content: block.text,
             partial: output,
           });
+          tlog(
+            `pushed text_end      contentIndex=${tracked.piIndex} ` +
+              `len=${block.text.length}`,
+          );
         } else if (tracked.kind === "thinking") {
           const block = output.content[tracked.piIndex] as ThinkingContent;
           stream?.push({
@@ -608,11 +1159,18 @@ export function createEventBridge(
             toolCall: output.content[tracked.piIndex] as ToolCall,
             partial: output,
           });
+          tlog(
+            `pushed toolcall_end   contentIndex=${tracked.piIndex} ` +
+              `name=${tracked.toolName} id=${String((output.content[tracked.piIndex] as ToolCall).id).slice(-8)}`,
+          );
         }
         return;
       }
 
       case "message_delta": {
+        // Auto-trigger mode: skip touching the user-visible segment's
+        // stopReason/usage.
+        if (currentTurnKind === "auto_triggered") return;
         if (event.delta?.stop_reason) {
           rawStopReason = event.delta.stop_reason;
         }
@@ -621,7 +1179,13 @@ export function createEventBridge(
       }
 
       case "message_stop": {
+        // Auto-trigger mode: don't mark sawMessageStop (user-response
+        // segment isn't ready yet).
+        if (currentTurnKind === "auto_triggered") {
+          return;
+        }
         sawMessageStop = true;
+        tlog(`saw message_stop      pendingToolUseIds=${pendingToolUseIds.size}`);
         return;
       }
     }
@@ -743,6 +1307,10 @@ export function createEventBridge(
     };
     cacheToolResult(id, entry);
     pendingToolUseIds.delete(id);
+    tlog(
+      `ingested tool_result name=${toolName} id=${id.slice(-8)} ` +
+        `isError=${isError} pendingNow=${pendingToolUseIds.size}`,
+    );
   }
 
   function updateUsage(u: any): void {
@@ -910,6 +1478,17 @@ export function createEventBridge(
     getSdkSessionId: () => sdkSessionId,
     getFastModeState: () => fastModeState,
     getCost: () => cost,
+    notePush(pushTime: number): void {
+      const wasIdleAtPushTime = sdkState === "idle";
+      pushQueue.push({ pushTime, wasIdleAtPushTime });
+      if (DEBUG) {
+        console.error(
+          `[pi-cas/debug] notePush t=${pushTime} sdkState=${sdkState} ` +
+            `wasIdle=${wasIdleAtPushTime} queueLen=${pushQueue.length}`,
+        );
+      }
+    },
+    getSyntheticToolUseIdsForCurrentSegment: () => [...segmentSyntheticToolUseIds],
   };
 }
 

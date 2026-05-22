@@ -61,6 +61,22 @@ import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 const DEBUG = process.env.PI_CAS_DEBUG === "1";
 
+/**
+ * Targeted timing diagnostic — see the matching constant in
+ * `event-bridge.ts`.  Same `T0` (process start) so log timestamps line up
+ * across modules.  Enable with PI_CAS_SEGMENT_TIMING=1.
+ */
+const TIMING_DEBUG = process.env.PI_CAS_SEGMENT_TIMING === "1";
+const TIMING_T0 = Date.now();
+function tlog(msg: string): void {
+  if (!TIMING_DEBUG) return;
+  const t = String(Date.now() - TIMING_T0).padStart(7);
+  console.error(`[pi-cas/timing][askuser] +${t}ms ${msg}`);
+}
+function truncateForLog(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}...` : s;
+}
+
 /* ----------------------------- types ----------------------------- */
 
 /**
@@ -130,7 +146,9 @@ export async function askUserQuestionDialog(
       }
       continue;
     }
+    tlog(`opening question ${i + 1}/${questions.length}: ${truncateForLog(q.question, 60)}`);
     const answer = await singleQuestionDialog(q, i + 1, questions.length, ctx, signal);
+    tlog(`question ${i + 1}/${questions.length} resolved answer=${answer === null ? "null(cancel)" : truncateForLog(answer, 60)}`);
     if (answer === null) return { kind: "cancelled", reason: "user-cancelled" };
     answers[q.question] = answer;
   }
@@ -183,6 +201,9 @@ async function singleQuestionDialog(
       tui.requestRender();
     }
 
+    let firstRenderSeen = false;
+    let firstInputSeen = false;
+
     function moveCursor(delta: number) {
       const next = cursorIndex + delta;
       if (next < 0 || next >= q.options.length) return;
@@ -214,6 +235,10 @@ async function singleQuestionDialog(
     }
 
     function handleInput(data: string) {
+      if (!firstInputSeen) {
+        firstInputSeen = true;
+        tlog(`first keystroke received for question ${index}/${total}`);
+      }
       if (matchesKey(data, Key.up)) return moveCursor(-1);
       if (matchesKey(data, Key.down)) return moveCursor(1);
       if (matchesKey(data, Key.enter)) return submit();
@@ -233,6 +258,10 @@ async function singleQuestionDialog(
     }
 
     function render(width: number): string[] {
+      if (!firstRenderSeen) {
+        firstRenderSeen = true;
+        tlog(`overlay first render  question ${index}/${total} width=${width}`);
+      }
       const lines: string[] = [];
       const add = (s: string) => lines.push(truncateToWidth(s, width));
 
@@ -323,6 +352,11 @@ export async function handleCanUseTool(
 > {
   if (toolName === "AskUserQuestion") {
     const ctx = getCtx();
+    {
+      const qs = (input as { questions?: AskQuestion[] })?.questions;
+      const count = Array.isArray(qs) ? qs.length : 0;
+      tlog(`canUseTool entered    toolUseID=${opts.toolUseID.slice(-8)} questions=${count}`);
+    }
     if (!ctx) {
       // We have no ctx — neither session_start nor turn_start has fired
       // yet.  Should be rare; in practice an AskUserQuestion mid-session
@@ -346,11 +380,13 @@ export async function handleCanUseTool(
           `(${count} question${count === 1 ? "" : "s"}, hasUI=${ctx.hasUI})`,
       );
     }
+    tlog(`dispatching to dialog toolUseID=${opts.toolUseID.slice(-8)}`);
     const result = await askUserQuestionDialog(
       input as { questions?: AskQuestion[] },
       ctx,
       opts.signal,
     );
+    tlog(`dialog returned       toolUseID=${opts.toolUseID.slice(-8)} kind=${result.kind}`);
     if (result.kind === "cancelled") {
       if (DEBUG) {
         console.error(`[pi-cas/debug] canUseTool(AskUserQuestion): cancelled (${result.reason})`);
