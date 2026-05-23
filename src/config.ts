@@ -65,6 +65,24 @@ export interface ProviderConfig {
   /** Base URL from the most recent successful relay turn, for /cas-status. */
   lastOktaBaseUrl?: string;
   /**
+   * Per-process cache of the okta relay access token, used by the in-process
+   * HTTP proxy's `apiKeyProvider` to rewrite `x-api-key` on every Anthropic
+   * call out of the bundled `claude` subprocess. Without per-request rewrite
+   * the subprocess would happily reuse the SAME ANTHROPIC_API_KEY it was
+   * spawned with for the lifetime of the SDK session — and once that JWT
+   * expires (~24h with pi-hawk-provider), every request 401s.
+   *
+   * The cache is provider-instance-scoped (one map per `registerProvider`
+   * call). `fetchedAt: 0` + `token: undefined` is the "empty" state. The
+   * proxy's apiKeyProvider closure reads/writes this; ensureSession seeds
+   * it at session spawn so the first request doesn't re-round-trip the
+   * event bus.
+   *
+   * Optional because non-okta provider instances don't need it; populated
+   * lazily by registerProvider when `oktaEnabled`.
+   */
+  oktaTokenCache?: { token?: string; fetchedAt: number };
+  /**
    * SDK permission mode for the bundled `claude` subprocess. In the
    * Option A architecture the SDK runs all tools natively, so this is
    * the knob that decides what's allowed without prompting.

@@ -1,10 +1,28 @@
 /**
- * Minimal HTTP-in / HTTPS-out logging proxy.
+ * Minimal HTTP-in / HTTPS-out logging + auth-rewriting proxy.
  *
  * Use case: we control what `ANTHROPIC_BASE_URL` the bundled `claude` subprocess
- * sees, so we can point it at this proxy on localhost. The proxy logs each
- * request (method, path, headers, body) to a JSONL file and forwards to a
- * configurable upstream URL (e.g. https://middleman.prd.metr.org/anthropic).
+ * sees, so we can point it at this proxy on localhost. The proxy (optionally)
+ * logs each request to a JSONL file and forwards to a configurable upstream
+ * URL (e.g. https://middleman.prd.metr.org/anthropic).
+ *
+ * It has two orthogonal jobs, either of which can be enabled independently:
+ *
+ *   1. **Logging.** When `logFilePath` is set, write a JSONL record of every
+ *      request + response. When omitted, no log file is created and logging
+ *      is a no-op.
+ *
+ *   2. **Per-request auth rewriting.** When `apiKeyProvider` is set, the proxy
+ *      awaits it before forwarding each request upstream and replaces the
+ *      incoming `x-api-key` (stripping `authorization` while it's at it, since
+ *      the relay only accepts x-api-key) with whatever the provider returns.
+ *      This is how pi-cas keeps the bundled `claude` subprocess's effectively-
+ *      static ANTHROPIC_API_KEY in sync with a rotating OAuth access token:
+ *      the subprocess sends a stale key, the proxy swaps in a fresh one
+ *      sourced from the okta relay. If the provider throws (refresh failed,
+ *      responder unreachable, etc.), the proxy returns a 502 with a
+ *      structured `auth_refresh_failed` error body so the subprocess sees a
+ *      clear failure instead of a confusing 401 from upstream.
  *
  * Why not use mitmproxy / a real proxy? We want zero install footprint and
  * automatic lifecycle tied to the pi session. Why not log inside the
@@ -17,7 +35,10 @@
  *   - Response body is streamed through unchanged \u2014 SSE works as expected.
  *     We log status + headers; with `logResponseBody: true` we also tee the
  *     SSE stream into the log up to a 1 MiB cap.
- *   - The x-api-key / Authorization headers are redacted in the log.
+ *   - The x-api-key / Authorization headers are redacted in the log. The log
+ *     records the INCOMING header (what the subprocess sent), not the
+ *     possibly-rewritten one forwarded upstream \u2014 both are redacted anyway,
+ *     so the distinction only matters if you decode lengths.
  *   - No TLS termination on the listen side: the proxy speaks HTTP. `claude`
  *     doesn't care because ANTHROPIC_BASE_URL says http://.
  *   - Upstream is mutable: callers can switch the upstream URL at runtime
@@ -40,8 +61,13 @@ import { URL } from "node:url";
 export interface LogProxyOptions {
   /** Initial upstream base URL, e.g. "https://middleman.prd.metr.org/anthropic". */
   initialUpstreamBaseUrl: string;
-  /** Path to the JSONL log file. Appended; rotated externally. */
-  logFilePath: string;
+  /**
+   * Path to the JSONL log file. Appended; rotated externally. When omitted,
+   * the proxy still forwards traffic but doesn't open or write any file —
+   * useful when the proxy is being used purely for `apiKeyProvider` auth
+   * rewriting without logging.
+   */
+  logFilePath?: string;
   /** If true, also append response body chunks (SSE) to the log. Default false. */
   logResponseBody?: boolean;
   /** Hostname to bind. Default "127.0.0.1". */
@@ -50,6 +76,22 @@ export interface LogProxyOptions {
   port?: number;
   /** Header names to redact (case-insensitive). Default: api-key / auth headers. */
   redactHeaders?: string[];
+  /**
+   * Optional async supplier for a fresh credential. When set, the proxy
+   * awaits this before each upstream forward and overrides the incoming
+   * `x-api-key` header with the returned value, additionally stripping any
+   * `authorization` header (the relay we forward to only accepts x-api-key
+   * auth, and a stale Bearer would otherwise be sent alongside the fresh
+   * api key).
+   *
+   * Failure modes:
+   *   - Provider throws / rejects → 502 with `{ error: { type:
+   *     "auth_refresh_failed", message } }` body. Logged as `auth_error`.
+   *   - Provider returns empty string → same as throwing.
+   *
+   * Synchronous suppliers can wrap their value in `Promise.resolve(...)`.
+   */
+  apiKeyProvider?: () => Promise<string>;
 }
 
 export interface LogProxyHandle {
@@ -63,8 +105,8 @@ export interface LogProxyHandle {
   setUpstreamBaseUrl(url: string): void;
   /** Stop the proxy and flush the log. Idempotent. */
   close(): Promise<void>;
-  /** Absolute path of the log file (for diagnostics). */
-  logFilePath: string;
+  /** Absolute path of the log file (for diagnostics), or undefined if logging is disabled. */
+  logFilePath: string | undefined;
   /** Numeric port the proxy bound to. */
   port: number;
 }
@@ -97,14 +139,23 @@ export async function startLogProxy(opts: LogProxyOptions): Promise<LogProxyHand
     (opts.redactHeaders ?? DEFAULT_REDACTED_HEADERS).map((h) => h.toLowerCase()),
   );
   const logResponseBody = opts.logResponseBody === true;
+  const apiKeyProvider = opts.apiKeyProvider;
 
-  const logStream: WriteStream = createWriteStream(opts.logFilePath, { flags: "a" });
-  await new Promise<void>((resolve, reject) => {
-    logStream.once("open", () => resolve());
-    logStream.once("error", reject);
-  });
+  // Logging is optional — the proxy is also used purely for `apiKeyProvider`
+  // header rewriting. When no log path is given we skip the file open and
+  // turn `appendLog` into a no-op so the rest of the handler doesn't need
+  // to branch.
+  let logStream: WriteStream | undefined;
+  if (opts.logFilePath) {
+    logStream = createWriteStream(opts.logFilePath, { flags: "a" });
+    await new Promise<void>((resolve, reject) => {
+      logStream!.once("open", () => resolve());
+      logStream!.once("error", reject);
+    });
+  }
 
   function appendLog(entry: Record<string, unknown>): void {
+    if (!logStream) return;
     try {
       logStream.write(JSON.stringify(entry) + "\n");
     } catch {
@@ -153,6 +204,10 @@ export async function startLogProxy(opts: LogProxyOptions): Promise<LogProxyHand
     const chunks: Buffer[] = [];
     clientReq.on("data", (c: Buffer) => chunks.push(c));
     clientReq.on("end", () => {
+      // Wrap in an async IIFE so we can `await apiKeyProvider()` between
+      // collecting the request body and starting the upstream request,
+      // without restructuring the existing event-driven flow.
+      void (async () => {
       const reqBodyBuf = Buffer.concat(chunks);
       const reqContentType =
         (clientReq.headers["content-type"] as string | undefined) ?? undefined;
@@ -164,15 +219,59 @@ export async function startLogProxy(opts: LogProxyOptions): Promise<LogProxyHand
           ? subprocessPath
           : `${upstreamPathPrefix}${subprocessPath}`;
 
+      // Build outgoing headers. When `apiKeyProvider` is set we skip the
+      // incoming `x-api-key` / `authorization` entirely (we'll inject a fresh
+      // x-api-key below) — otherwise we'd briefly forward the stale credential
+      // before the override took effect on a separate header.
       const outHeaders: Record<string, string | string[]> = {};
       for (const [k, v] of Object.entries(clientReq.headers)) {
         if (v === undefined) continue;
         const lower = k.toLowerCase();
         if (lower === "host" || lower === "connection" || lower === "content-length") continue;
+        if (apiKeyProvider && (lower === "x-api-key" || lower === "authorization")) continue;
         outHeaders[k] = v;
       }
       outHeaders["host"] = upstream.host;
       if (reqBodyBuf.length > 0) outHeaders["content-length"] = String(reqBodyBuf.length);
+
+      // Per-request credential refresh. Failure must short-circuit BEFORE we
+      // open the upstream socket — otherwise we'd send a request with no /
+      // stale x-api-key and get a confusing 401 from upstream.
+      if (apiKeyProvider) {
+        let freshKey = "";
+        let authError: string | undefined;
+        try {
+          freshKey = await apiKeyProvider();
+        } catch (err) {
+          authError = err instanceof Error ? err.message : String(err);
+        }
+        if (!authError && !freshKey) {
+          authError = "apiKeyProvider returned empty string";
+        }
+        if (authError) {
+          appendLog({
+            ts: new Date().toISOString(),
+            id: requestId,
+            type: "auth_error",
+            error: authError,
+            elapsedMs: Date.now() - startedAt,
+          });
+          if (!clientRes.headersSent) {
+            clientRes.writeHead(502, { "content-type": "application/json" });
+            clientRes.end(
+              JSON.stringify({
+                error: { type: "auth_refresh_failed", message: authError },
+              }),
+            );
+          } else {
+            try {
+              clientRes.end();
+            } catch {}
+          }
+          return;
+        }
+        outHeaders["x-api-key"] = freshKey;
+      }
 
       appendLog({
         ts: startedAtIso,
@@ -183,6 +282,10 @@ export async function startLogProxy(opts: LogProxyOptions): Promise<LogProxyHand
         upstreamPath,
         headers: redact(clientReq.headers),
         bodyBytes: reqBodyBuf.length,
+        // `apiKeyRewritten` lets log readers know the x-api-key on the wire
+        // wasn't the one in `headers` above. (We deliberately don't log the
+        // fresh key, even redacted — it'd be the same redaction string.)
+        apiKeyRewritten: apiKeyProvider ? true : undefined,
         body:
           reqBodyParsed ??
           (reqBodyBuf.length > 0 ? reqBodyBuf.toString("utf8").slice(0, 65536) : null),
@@ -283,6 +386,7 @@ export async function startLogProxy(opts: LogProxyOptions): Promise<LogProxyHand
 
       if (reqBodyBuf.length > 0) upstreamReq.write(reqBodyBuf);
       upstreamReq.end();
+      })();
     });
 
     clientReq.on("error", (err) => {
@@ -342,7 +446,10 @@ export async function startLogProxy(opts: LogProxyOptions): Promise<LogProxyHand
       closed = true;
       appendLog({ ts: new Date().toISOString(), type: "proxy_stopping" });
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      await new Promise<void>((resolve) => logStream.end(() => resolve()));
+      if (logStream) {
+        const ls = logStream;
+        await new Promise<void>((resolve) => ls.end(() => resolve()));
+      }
     },
   };
 }

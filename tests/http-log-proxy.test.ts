@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { createServer, type Server } from "node:http";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createServer, type Server, type IncomingMessage } from "node:http";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startLogProxy, type LogProxyHandle } from "../src/http-log-proxy.js";
@@ -171,6 +171,164 @@ describe("http-log-proxy", () => {
       await new Promise((r) => setTimeout(r, 50));
       const lines = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
       expect(lines.some((l) => l.type === "upstream_error")).toBe(true);
+    } finally {
+      await proxy.close();
+    }
+  });
+
+  // ---- apiKeyProvider (per-request auth rewrite) ----
+  //
+  // These tests cover the second job of the proxy: rewriting `x-api-key` on
+  // every forwarded request so a long-lived `claude` subprocess can ride a
+  // rotating OAuth token without restart. The motivation is documented at
+  // the top of http-log-proxy.ts.
+
+  it("apiKeyProvider rewrites x-api-key and strips authorization on every forward", async () => {
+    // Capture what the upstream actually receives so we can assert on the
+    // rewritten headers (the subprocess's view is irrelevant — what hits
+    // Anthropic is the only thing that matters for auth refresh).
+    const seen: { xApiKey?: string | string[]; authorization?: string | string[] }[] = [];
+    const echoUpstream = createServer((req: IncomingMessage, res) => {
+      seen.push({
+        xApiKey: req.headers["x-api-key"],
+        authorization: req.headers["authorization"],
+      });
+      res.statusCode = 200;
+      res.end("{}");
+    });
+    await new Promise<void>((resolve) => echoUpstream.listen(0, "127.0.0.1", () => resolve()));
+    const echoAddr = echoUpstream.address() as { port: number };
+
+    let callCount = 0;
+    const proxy = await startLogProxy({
+      initialUpstreamBaseUrl: `http://127.0.0.1:${echoAddr.port}/`,
+      logFilePath: join(tmpDir, "auth-rewrite.jsonl"),
+      apiKeyProvider: async () => `fresh-token-${++callCount}`,
+    });
+
+    try {
+      // First call: subprocess sends a stale x-api-key AND a stale Bearer.
+      // We expect upstream to see fresh-token-1 and no Authorization at all.
+      await fetch(`${proxy.getBaseUrl()}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "stale-subprocess-token",
+          "authorization": "Bearer stale-bearer",
+        },
+        body: "{}",
+      });
+      // Second call: same stale headers, expect fresh-token-2 (provider
+      // is invoked every request — caller decides if it wants to cache).
+      await fetch(`${proxy.getBaseUrl()}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "stale-subprocess-token",
+        },
+        body: "{}",
+      });
+
+      expect(seen).toHaveLength(2);
+      expect(seen[0].xApiKey).toBe("fresh-token-1");
+      expect(seen[0].authorization).toBeUndefined();
+      expect(seen[1].xApiKey).toBe("fresh-token-2");
+    } finally {
+      await proxy.close();
+      await new Promise<void>((resolve) => echoUpstream.close(() => resolve()));
+    }
+  });
+
+  it("apiKeyProvider failure returns 502 auth_refresh_failed without hitting upstream", async () => {
+    // Upstream should never see this request. If it does, we surface that
+    // as a test failure (signals the short-circuit logic regressed).
+    let upstreamHits = 0;
+    const upstream = createServer((_req, res) => {
+      upstreamHits += 1;
+      res.statusCode = 200;
+      res.end("{}");
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", () => resolve()));
+    const addr = upstream.address() as { port: number };
+
+    const logPath = join(tmpDir, "auth-fail.jsonl");
+    const proxy = await startLogProxy({
+      initialUpstreamBaseUrl: `http://127.0.0.1:${addr.port}/`,
+      logFilePath: logPath,
+      apiKeyProvider: async () => {
+        throw new Error("refresh token revoked");
+      },
+    });
+    try {
+      const res = await fetch(`${proxy.getBaseUrl()}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "anything" },
+        body: "{}",
+      });
+      expect(res.status).toBe(502);
+      const body = (await res.json()) as { error?: { type?: string; message?: string } };
+      expect(body.error?.type).toBe("auth_refresh_failed");
+      expect(body.error?.message).toContain("refresh token revoked");
+      expect(upstreamHits).toBe(0);
+
+      await new Promise((r) => setTimeout(r, 50));
+      const lines = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(lines.some((l) => l.type === "auth_error" && l.error?.includes("revoked"))).toBe(true);
+      // We must NOT have logged a `request` entry — the request never
+      // legitimately went out, and surfacing it as a request would confuse
+      // log consumers counting upstream traffic.
+      expect(lines.some((l) => l.type === "request")).toBe(false);
+    } finally {
+      await proxy.close();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
+
+  it("apiKeyProvider returning empty string is treated as failure", async () => {
+    const upstream = createServer((_req, res) => {
+      res.statusCode = 200;
+      res.end("{}");
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", () => resolve()));
+    const addr = upstream.address() as { port: number };
+
+    const proxy = await startLogProxy({
+      initialUpstreamBaseUrl: `http://127.0.0.1:${addr.port}/`,
+      logFilePath: join(tmpDir, "auth-empty.jsonl"),
+      apiKeyProvider: async () => "",
+    });
+    try {
+      const res = await fetch(`${proxy.getBaseUrl()}/v1/messages`);
+      expect(res.status).toBe(502);
+      const body = (await res.json()) as { error?: { type?: string; message?: string } };
+      expect(body.error?.type).toBe("auth_refresh_failed");
+      expect(body.error?.message).toContain("empty");
+    } finally {
+      await proxy.close();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
+
+  it("works without logFilePath (auth-rewrite-only mode creates no log file)", async () => {
+    // Use the existing class-level upstream so we don't need another fake.
+    const noLogPath = join(tmpDir, "this-should-not-exist.jsonl");
+    expect(existsSync(noLogPath)).toBe(false);
+
+    const proxy = await startLogProxy({
+      initialUpstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/route`,
+      // logFilePath intentionally omitted
+      apiKeyProvider: async () => "supplied-by-callback",
+    });
+    expect(proxy.logFilePath).toBeUndefined();
+
+    try {
+      const res = await fetch(`${proxy.getBaseUrl()}/v1/messages`, { method: "GET" });
+      expect(res.status).toBe(200);
+      await res.text();
+
+      // No file should have been created at the absent path or anywhere
+      // else the proxy might have defaulted to.
+      expect(existsSync(noLogPath)).toBe(false);
     } finally {
       await proxy.close();
     }

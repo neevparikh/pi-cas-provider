@@ -255,28 +255,81 @@ export function registerProvider(pi: ExtensionAPI): void {
   // per-session tracking.
   const ctxRef: { current?: ExtensionContext } = {};
 
-  // Optional HTTP log proxy.  Same lifecycle as before: lazy-start, point the
-  // subprocess at it via env, forward to whichever upstream we end up using.
+  // In-process HTTP proxy. Started lazily when either:
+  //   - `PI_CAS_HTTP_LOG` is set (the classic logging use case), OR
+  //   - okta relay mode is on (the proxy rewrites `x-api-key` per-request
+  //     so the long-lived `claude` subprocess can keep using a stable
+  //     ANTHROPIC_API_KEY while the underlying OAuth token rotates).
+  //
+  // Both knobs are independent: turn on logging without okta to capture a
+  // session's HTTP traffic, or turn on okta without logging to get
+  // auto-refresh without writing a log file. When both are on, the proxy
+  // does both jobs in one server.
+  //
+  // Token cache lives on `config` (see ProviderConfig.oktaTokenCache) so
+  // ensureSession — which is a top-level function reached through
+  // streamViaSDK — can seed it after the per-session relay call.
+  if (config.oktaEnabled && !config.oktaTokenCache) {
+    config.oktaTokenCache = { fetchedAt: 0 };
+  }
+  // 60s is short relative to the JWT TTL (~24h in pi-hawk-provider's
+  // current config) but long enough that a burst of upstream calls during
+  // a single SDK turn doesn't issue 50 event-bus round-trips. The relay
+  // responder (pi-hawk-provider) has its own cache against the JWT's
+  // `expires` field so an actual Okta refresh-grant only fires when the
+  // JWT is genuinely near expiry — this layer just spares the event bus.
+  const TOKEN_CACHE_TTL_MS = 60_000;
+  const oktaApiKeyProvider: (() => Promise<string>) | undefined = config.oktaEnabled
+    ? async () => {
+        const cache = config.oktaTokenCache!;
+        if (cache.token && Date.now() - cache.fetchedAt < TOKEN_CACHE_TTL_MS) {
+          return cache.token;
+        }
+        const r = await requestRelay(pi, {
+          preferredProvider: config.oktaProvider,
+          timeoutMs: 8000,
+        });
+        cache.token = r.accessToken;
+        cache.fetchedAt = Date.now();
+        config.lastOktaProvider = r.provider;
+        config.lastOktaBaseUrl = r.baseUrl;
+        // Keep proxy upstream in sync. The relay responder is currently
+        // expected to return a stable baseUrl per session, but treating it
+        // as authoritative on each refresh costs nothing and would absorb
+        // any future endpoint rotation transparently.
+        if (logProxyHandle) logProxyHandle.setUpstreamBaseUrl(r.baseUrl);
+        return r.accessToken;
+      }
+    : undefined;
+
+  let logProxyHandle: LogProxyHandle | undefined;
   let logProxyPromise: Promise<LogProxyHandle> | undefined;
   const httpLogPath = process.env.PI_CAS_HTTP_LOG?.trim();
-  if (httpLogPath) {
+  if (httpLogPath || config.oktaEnabled) {
     const logResponseBody =
       process.env.PI_CAS_HTTP_LOG_RESPONSES === "1" ||
       process.env.PI_CAS_HTTP_LOG_RESPONSES === "true";
     logProxyPromise = startLogProxy({
       initialUpstreamBaseUrl: "https://api.anthropic.com",
-      logFilePath: httpLogPath,
+      ...(httpLogPath ? { logFilePath: httpLogPath } : {}),
       logResponseBody,
+      ...(oktaApiKeyProvider ? { apiKeyProvider: oktaApiKeyProvider } : {}),
     });
     logProxyPromise.then(
-      (h) =>
+      (h) => {
+        logProxyHandle = h;
+        const logSuffix = h.logFilePath
+          ? `log: ${h.logFilePath}${logResponseBody ? " (with response bodies)" : ""}`
+          : "no log file (auth-rewrite only)";
+        const authSuffix = oktaApiKeyProvider ? " · auth-rewrite ON (okta relay)" : "";
         console.error(
-          `[pi-cas] HTTP log proxy listening on ${h.getBaseUrl()} → (per-turn upstream); ` +
-            `log: ${h.logFilePath}${logResponseBody ? " (with response bodies)" : ""}`,
-        ),
+          `[pi-cas] HTTP proxy listening on ${h.getBaseUrl()} → (per-turn upstream); ` +
+            `${logSuffix}${authSuffix}`,
+        );
+      },
       (err) =>
         console.error(
-          `[pi-cas] HTTP log proxy failed to start: ${
+          `[pi-cas] HTTP proxy failed to start: ${
             err instanceof Error ? err.message : String(err)
           } — continuing without it`,
         ),
@@ -1109,6 +1162,16 @@ async function ensureSession(
   }
 
   // Resolve okta relay BEFORE spawning so we can fail fast.
+  //
+  // The token returned here is what we bake into the subprocess's
+  // ANTHROPIC_API_KEY env var. That value goes stale after the JWT TTL
+  // (~24h), but it doesn't matter — when the proxy is in front of the
+  // subprocess (which it always is in okta mode now), every request's
+  // x-api-key gets rewritten by `oktaApiKeyProvider` before going upstream.
+  // The env value just has to be non-empty so the bundled `claude` CLI
+  // doesn't bail at startup. We seed `tokenCache` from this call so the
+  // proxy's first request reuses the same token without an extra
+  // event-bus round-trip.
   let relay: RelayConfig | undefined;
   if (config.oktaEnabled) {
     relay = await requestRelay(pi, {
@@ -1117,9 +1180,16 @@ async function ensureSession(
     });
     config.lastOktaProvider = relay.provider;
     config.lastOktaBaseUrl = relay.baseUrl;
+    // Seed the proxy's token cache so its first request reuses this token
+    // rather than issuing a redundant event-bus round-trip. The cache is
+    // owned by registerProvider; ensureSession only writes to it.
+    if (config.oktaTokenCache) {
+      config.oktaTokenCache.token = relay.accessToken;
+      config.oktaTokenCache.fetchedAt = Date.now();
+    }
     if (DEBUG) {
       console.error(
-        `[pi-cas/debug] okta relay resolved: ${relay.provider} → ${relay.baseUrl}`,
+        `[pi-cas/debug] okta relay resolved: ${relay.provider} → ${relay.baseUrl} (token cache seeded)`,
       );
     }
   }
@@ -1127,7 +1197,9 @@ async function ensureSession(
   // Build the env for the subprocess.
   const env = buildSubprocessEnv(config, relay);
 
-  // HTTP log proxy: point the subprocess at it.
+  // HTTP proxy: point the subprocess at it. Always required in okta mode
+  // (the proxy rewrites x-api-key per-request to keep the long-lived
+  // subprocess auth-fresh); optional otherwise (just logging).
   if (logProxyPromise) {
     try {
       const proxy = await logProxyPromise;
@@ -1136,11 +1208,24 @@ async function ensureSession(
       env.ANTHROPIC_BASE_URL = proxy.getBaseUrl();
       if (DEBUG) {
         console.error(
-          `[pi-cas/debug] log proxy active: ${proxy.getBaseUrl()} → ${trueUpstream}`,
+          `[pi-cas/debug] HTTP proxy active: ${proxy.getBaseUrl()} → ${trueUpstream}` +
+            (config.oktaEnabled ? " (x-api-key rewritten per request)" : ""),
         );
       }
     } catch (err) {
-      if (DEBUG) console.error(`[pi-cas/debug] log proxy unavailable:`, err);
+      // In okta mode the proxy is load-bearing for auth refresh — losing it
+      // means the subprocess will 401 once the baked-in token expires. Log
+      // loudly so the failure mode is debuggable.
+      if (config.oktaEnabled) {
+        console.error(
+          `[pi-cas] HTTP proxy unavailable in okta mode — auth-refresh is OFF; ` +
+            `the subprocess will 401 once the initial token expires. Cause: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+        );
+      } else if (DEBUG) {
+        console.error(`[pi-cas/debug] log proxy unavailable:`, err);
+      }
     }
   }
 
