@@ -46,6 +46,18 @@
  * invokes canUseTool, `ctxRef.current` is set.  Headless / RPC mode has
  * `ctx.hasUI === false` and we gracefully deny.
  *
+ * # Hosts without a TUI overlay (pirouette etc.)
+ *
+ * Some hosts (notably pirouette's web dashboard) implement
+ * `ExtensionUIContext` but cannot host `ui.custom` — it requires a
+ * pi-tui Component factory.  Their stub returns `undefined` and never
+ * invokes the factory.  We detect this by flipping a sentinel inside
+ * the factory body: if it's still `false` after `ui.custom` resolves,
+ * we know we're on a non-TUI host and fall through to a portable
+ * `ui.select`-based path (one `select()` per question; multi-select
+ * loops with a sentinel "done" option to accumulate picks).  Cached
+ * per-ctx so we only probe once.
+ *
  * # Limitations (v1)
  *
  * - One question at a time (modal); multi-question prompts iterate.
@@ -54,6 +66,9 @@
  * - No annotation/notes support (the SDK schema allows free-text per-
  *   question notes; we don't collect them).
  * - SDK signal abort closes the dialog cleanly; pi's own escape works.
+ * - The select-based fallback can't show option `description` text
+ *   (the SDK's `select` only takes label strings); descriptions are
+ *   appended to the question line so they're not lost entirely.
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -171,7 +186,22 @@ async function singleQuestionDialog(
   ctx: ExtensionContext,
   signal: AbortSignal,
 ): Promise<string | null> {
-  return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+  // Hosts without a TUI overlay (pirouette's web dashboard) implement
+  // `ui.custom` as a no-op that immediately resolves to undefined and
+  // never invokes the factory.  We detect that by flipping a sentinel
+  // inside the factory body; if it stays false after the promise
+  // resolves, we route to a portable `ui.select` fallback.
+  //
+  // We probe-and-cache per ExtensionContext (per agent) so the cost is
+  // amortised.  See `tuiCustomSupport` cache.
+  const tuiSupported = isTUICustomSupported(ctx);
+  if (tuiSupported === false) {
+    return selectBasedDialog(q, ctx, signal);
+  }
+
+  let factoryInvoked = false;
+  const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+    factoryInvoked = true;
     let cursorIndex = 0;
     const selected = new Set<number>();
     const multi = q.multiSelect === true;
@@ -311,6 +341,119 @@ async function singleQuestionDialog(
       handleInput,
     };
   });
+
+  // If the factory never ran, this host's `ui.custom` is a no-op (RPC
+  // mode, pirouette, or any other non-TUI implementation).  Record the
+  // negative result so subsequent questions skip the probe, and
+  // re-issue the prompt through `ui.select` instead.
+  if (!factoryInvoked) {
+    tuiCustomSupport.set(ctx, false);
+    if (DEBUG) {
+      console.error(
+        `[pi-cas/debug] singleQuestionDialog: ui.custom is a no-op on this host; falling back to ui.select`,
+      );
+    }
+    return selectBasedDialog(q, ctx, signal);
+  }
+  tuiCustomSupport.set(ctx, true);
+  return result;
+}
+
+/* ----------------------------- non-TUI fallback ----------------------------- */
+
+/**
+ * Per-ExtensionContext memo of whether `ui.custom` actually renders.
+ * Keyed by the ctx object (WeakMap so a torn-down agent's entry is
+ * GC'd).  `undefined` = not yet probed, `true` = TUI overlay works,
+ * `false` = host is a no-op stub; use `ui.select` instead.
+ *
+ * Why per-ctx instead of per-process: a single pi-cas-provider build
+ * can be loaded into both a pi TUI session and a pirouette session in
+ * the same Node process (rare but possible via test harnesses), and
+ * we want each context routed correctly.
+ */
+const tuiCustomSupport = new WeakMap<ExtensionContext, boolean>();
+
+function isTUICustomSupported(ctx: ExtensionContext): boolean | undefined {
+  return tuiCustomSupport.get(ctx);
+}
+
+/**
+ * Portable per-question dialog implemented on top of `ctx.ui.select`.
+ *
+ * For single-select questions: one `select()` call, label of the
+ * chosen option is returned.
+ *
+ * For multi-select questions: loop on `select()` with a synthetic
+ * trailing "(done — submit selections)" sentinel.  Each pick toggles
+ * the corresponding option; submitting `done` resolves with the
+ * comma-joined picked labels (matches the SDK's documented multi-
+ * select shape — see AskUserQuestion tool docs).  An empty submission
+ * cancels.
+ *
+ * Cancel semantics: `select` returns `undefined` on cancel (esc / SDK
+ * AbortSignal); we map that to `null` so the caller's existing
+ * `answer === null` check still works.
+ */
+async function selectBasedDialog(
+  q: AskQuestion,
+  ctx: ExtensionContext,
+  signal: AbortSignal,
+): Promise<string | null> {
+  if (signal.aborted) return null;
+
+  // Build the title to include any "header" tag plus per-option
+  // descriptions, since `ui.select` only takes plain label strings.
+  const headerPrefix = q.header ? `[${q.header}] ` : "";
+  const descLines = q.options
+    .filter((o) => o?.description)
+    .map((o) => `  • ${o.label}: ${o.description}`);
+  const baseTitle =
+    descLines.length > 0
+      ? `${headerPrefix}${q.question}\n${descLines.join("\n")}`
+      : `${headerPrefix}${q.question}`;
+
+  if (q.multiSelect !== true) {
+    const picked = await ctx.ui.select(
+      baseTitle,
+      q.options.map((o) => o.label),
+      { signal },
+    );
+    if (picked === undefined) return null;
+    return picked;
+  }
+
+  // Multi-select loop.  The user picks options one at a time; we toggle
+  // the running set and re-prompt with the current selection reflected
+  // in the title.  "(done — submit selections)" submits the running
+  // set.  Empty submit cancels.
+  const DONE_SENTINEL = "(done — submit selections)";
+  const picked = new Set<string>();
+  while (true) {
+    if (signal.aborted) return null;
+    const selectedSummary =
+      picked.size > 0
+        ? `\nSelected: ${[...picked].join(", ")}`
+        : "\n(nothing selected yet)";
+    const options = [
+      ...q.options.map((o) => (picked.has(o.label) ? `✓ ${o.label}` : `  ${o.label}`)),
+      DONE_SENTINEL,
+    ];
+    const reply = await ctx.ui.select(baseTitle + selectedSummary, options, { signal });
+    if (reply === undefined) return null;
+    if (reply === DONE_SENTINEL) {
+      return picked.size > 0 ? [...picked].join(", ") : null;
+    }
+    // The displayed labels are prefixed with "✓ " or "  "; strip the
+    // marker to get the canonical option label back.
+    const canonical = reply.startsWith("✓ ")
+      ? reply.slice(2)
+      : reply.startsWith("  ")
+        ? reply.slice(2)
+        : reply;
+    if (picked.has(canonical)) picked.delete(canonical);
+    else picked.add(canonical);
+  }
 }
 
 /* ----------------------------- dispatcher ----------------------------- */

@@ -37,6 +37,14 @@ function makeCtx(opts: {
       done: (result: T) => void,
     ) => any,
   ) => Promise<T>;
+  /** When set, `ctx.ui.select` is wired to this stub. Used to exercise
+   *  the non-TUI fallback path (hosts like pirouette whose `custom` is
+   *  a no-op but whose `select` is real). */
+  select?: (
+    title: string,
+    options: string[],
+    opts?: { signal?: AbortSignal },
+  ) => Promise<string | undefined>;
 }): ExtensionContext {
   return {
     hasUI: opts.hasUI,
@@ -44,6 +52,9 @@ function makeCtx(opts: {
       // We only need `custom`; if a test reaches another method, that's a bug.
       custom: opts.custom ?? (() => {
         throw new Error("ctx.ui.custom called unexpectedly");
+      }),
+      select: opts.select ?? (() => {
+        throw new Error("ctx.ui.select called unexpectedly");
       }),
     } as any,
   } as any;
@@ -266,6 +277,96 @@ describe("askUserQuestionDialog", () => {
       kind: "answered",
       answers: { "Pick a meal:": "Breakfast" },
     });
+  });
+});
+
+/* ----------------------------- ui.select fallback (non-TUI hosts) ----------------------------- */
+
+/** Non-TUI hosts (pirouette's web dashboard, etc.) implement
+ *  `ExtensionUIContext` with `hasUI = true` and a real `ui.select` but
+ *  a no-op `ui.custom` (returns undefined; factory never runs).  The
+ *  dialog detects this and falls back to per-question `ui.select`. */
+describe("askUserQuestionDialog (non-TUI ui.select fallback)", () => {
+  const signal = new AbortController().signal;
+
+  /** Pirouette-style stub: `custom` resolves to undefined synchronously
+   *  and never invokes the factory. */
+  const noOpCustom = async () => undefined as any;
+
+  it("single-select: falls back to ui.select and returns the picked label", async () => {
+    const select = vi.fn(async () => "Blue");
+    const ctx = makeCtx({ hasUI: true, custom: noOpCustom, select });
+    const r = await askUserQuestionDialog({ questions: [Q1] }, ctx, signal);
+    expect(r).toEqual({
+      kind: "answered",
+      answers: { "What's your favorite color?": "Blue" },
+    });
+    expect(select).toHaveBeenCalledTimes(1);
+    // Descriptions get appended to the title since `ui.select` only
+    // accepts plain label strings.
+    const [titleArg, optionsArg] = select.mock.calls[0];
+    expect(titleArg).toContain("What's your favorite color?");
+    expect(titleArg).toContain("the color red");
+    expect(optionsArg).toEqual(["Red", "Blue"]);
+  });
+
+  it("single-select: returns cancelled when user dismisses ui.select (undefined)", async () => {
+    const select = vi.fn(async () => undefined);
+    const ctx = makeCtx({ hasUI: true, custom: noOpCustom, select });
+    const r = await askUserQuestionDialog({ questions: [Q1] }, ctx, signal);
+    expect(r).toEqual({ kind: "cancelled", reason: "user-cancelled" });
+  });
+
+  it("multi-select: loops with a sentinel done option and joins picks with ', '", async () => {
+    // User picks "Breakfast", then "Dinner", then the sentinel done.
+    // The fallback prefixes already-picked options with "✓ " in the
+    // displayed label, so the test mock can verify state across calls.
+    const calls: string[][] = [];
+    const select = vi.fn(async (_title: string, options: string[]) => {
+      calls.push(options);
+      // Call 1: pick Breakfast (label is "  Breakfast" initially, no ✓ yet).
+      if (calls.length === 1) return "  Breakfast";
+      // Call 2: pick Dinner (label is "  Dinner" — Breakfast was toggled
+      // in but Dinner wasn't yet).
+      if (calls.length === 2) return "  Dinner";
+      // Call 3: pick the sentinel done.
+      return "(done — submit selections)";
+    });
+    const ctx = makeCtx({ hasUI: true, custom: noOpCustom, select });
+    const r = await askUserQuestionDialog({ questions: [Q2] }, ctx, signal);
+    expect(r).toEqual({
+      kind: "answered",
+      answers: { "Pick a meal:": "Breakfast, Dinner" },
+    });
+    // Sanity: by the 3rd call, Breakfast and Dinner should be ✓'d.
+    expect(calls[2]).toContain("✓ Breakfast");
+    expect(calls[2]).toContain("✓ Dinner");
+    expect(calls[2]).toContain("  Lunch");
+    expect(calls[2][3]).toBe("(done — submit selections)");
+  });
+
+  it("multi-select: cancel mid-loop maps to user-cancelled", async () => {
+    const select = vi.fn(async () => undefined);
+    const ctx = makeCtx({ hasUI: true, custom: noOpCustom, select });
+    const r = await askUserQuestionDialog({ questions: [Q2] }, ctx, signal);
+    expect(r).toEqual({ kind: "cancelled", reason: "user-cancelled" });
+  });
+
+  it("multi-select: submitting done with nothing picked cancels", async () => {
+    const select = vi.fn(async () => "(done — submit selections)");
+    const ctx = makeCtx({ hasUI: true, custom: noOpCustom, select });
+    const r = await askUserQuestionDialog({ questions: [Q2] }, ctx, signal);
+    expect(r).toEqual({ kind: "cancelled", reason: "user-cancelled" });
+  });
+
+  it("caches the fallback decision per ctx — no second probe of ui.custom", async () => {
+    const custom = vi.fn(noOpCustom);
+    const select = vi.fn(async () => "Red");
+    const ctx = makeCtx({ hasUI: true, custom, select });
+    // Two questions back-to-back; both should land via select.
+    await askUserQuestionDialog({ questions: [Q1, Q1] }, ctx, signal);
+    expect(custom).toHaveBeenCalledTimes(1); // probed only on the first
+    expect(select).toHaveBeenCalledTimes(2); // both questions routed
   });
 });
 

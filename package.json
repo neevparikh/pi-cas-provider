@@ -1,6 +1,6 @@
 {
   "name": "pi-cas-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension that registers a Claude Agent SDK provider — uses your Claude Code auth, supports fast mode on Opus.",
   "type": "module",
   "main": "index.ts",
