@@ -294,7 +294,10 @@ describe("askUserQuestionDialog (non-TUI ui.select fallback)", () => {
   const noOpCustom = async () => undefined as any;
 
   it("single-select: falls back to ui.select and returns the picked label", async () => {
-    const select = vi.fn(async () => "Blue");
+    // Arg types declared so TypeScript infers .mock.calls[0] as a
+    // 2-tuple — otherwise vi.fn infers it from the 0-arg impl and the
+    // destructure below errors with "tuple of length 0 has no element".
+    const select = vi.fn(async (_title: string, _options: string[]) => "Blue");
     const ctx = makeCtx({ hasUI: true, custom: noOpCustom, select });
     const r = await askUserQuestionDialog({ questions: [Q1] }, ctx, signal);
     expect(r).toEqual({
