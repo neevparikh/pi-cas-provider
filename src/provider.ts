@@ -318,15 +318,20 @@ export function registerProvider(pi: ExtensionAPI): void {
     logProxyPromise.then(
       (h) => {
         logProxyHandle = h;
-        const logSuffix = h.logFilePath
-          ? `log: ${h.logFilePath}${logResponseBody ? " (with response bodies)" : ""}`
-          : "no log file (auth-rewrite only)";
-        const authSuffix = oktaApiKeyProvider ? " · auth-rewrite ON (okta relay)" : "";
-        console.error(
-          `[pi-cas] HTTP proxy listening on ${h.getBaseUrl()} → (per-turn upstream); ` +
-            `${logSuffix}${authSuffix}`,
-        );
+        // Banner is informational; the proxy works whether anyone reads
+        // this or not. Hide behind PI_CAS_DEBUG to keep startup quiet.
+        if (DEBUG) {
+          const logSuffix = h.logFilePath
+            ? `log: ${h.logFilePath}${logResponseBody ? " (with response bodies)" : ""}`
+            : "no log file (auth-rewrite only)";
+          const authSuffix = oktaApiKeyProvider ? " · auth-rewrite ON (okta relay)" : "";
+          console.error(
+            `[pi-cas/debug] HTTP proxy listening on ${h.getBaseUrl()} → (per-turn upstream); ` +
+              `${logSuffix}${authSuffix}`,
+          );
+        }
       },
+      // Failures stay unconditional — losing the proxy is a real problem.
       (err) =>
         console.error(
           `[pi-cas] HTTP proxy failed to start: ${
@@ -336,36 +341,41 @@ export function registerProvider(pi: ExtensionAPI): void {
     );
   }
 
-  const auth = getAuthStatus();
-  console.error(
-    `[pi-cas] ${formatAuthBanner(auth, {
-      okta: { enabled: config.oktaEnabled, provider: config.oktaProvider },
-    })}`,
-  );
-  if (config.fastMode) {
-    const env = process.env.PI_CAS_FAST_MODE;
-    const source =
-      env === "1" || env === "true"
-        ? "PI_CAS_FAST_MODE"
-        : `persisted preference (${statePath()})`;
-    console.error(`[pi-cas] fast mode enabled at startup — source: ${source}`);
-  }
-  console.error(`[pi-cas] permissionMode=${config.permissionMode}`);
-  if (config.configDirOverride) {
-    console.error(`[pi-cas] CLAUDE_CONFIG_DIR override: ${config.configDirOverride}`);
-  }
-  if (config.apiKeyOverride) {
-    console.error("[pi-cas] ANTHROPIC_API_KEY override active (PI_CAS_API_KEY)");
-  }
-  if (config.baseUrlOverride) {
-    console.error(`[pi-cas] ANTHROPIC_BASE_URL override: ${config.baseUrlOverride}`);
-  }
-  if (config.oktaEnabled) {
-    const who = config.oktaProvider ? `provider=${config.oktaProvider}` : "any responder";
+  // Startup banners are diagnostic noise on every launch once your setup
+  // is stable. Gate behind PI_CAS_DEBUG=1 so the terminal stays quiet by
+  // default. Warnings and errors below this block remain unconditional.
+  if (DEBUG) {
+    const auth = getAuthStatus();
     console.error(
-      `[pi-cas] okta relay mode ON (${who}) — bypassing local Claude Code auth, ` +
-        `routing subprocess through pi-cas:relay-request responder`,
+      `[pi-cas/debug] ${formatAuthBanner(auth, {
+        okta: { enabled: config.oktaEnabled, provider: config.oktaProvider },
+      })}`,
     );
+    if (config.fastMode) {
+      const env = process.env.PI_CAS_FAST_MODE;
+      const source =
+        env === "1" || env === "true"
+          ? "PI_CAS_FAST_MODE"
+          : `persisted preference (${statePath()})`;
+      console.error(`[pi-cas/debug] fast mode enabled at startup — source: ${source}`);
+    }
+    console.error(`[pi-cas/debug] permissionMode=${config.permissionMode}`);
+    if (config.configDirOverride) {
+      console.error(`[pi-cas/debug] CLAUDE_CONFIG_DIR override: ${config.configDirOverride}`);
+    }
+    if (config.apiKeyOverride) {
+      console.error("[pi-cas/debug] ANTHROPIC_API_KEY override active (PI_CAS_API_KEY)");
+    }
+    if (config.baseUrlOverride) {
+      console.error(`[pi-cas/debug] ANTHROPIC_BASE_URL override: ${config.baseUrlOverride}`);
+    }
+    if (config.oktaEnabled) {
+      const who = config.oktaProvider ? `provider=${config.oktaProvider}` : "any responder";
+      console.error(
+        `[pi-cas/debug] okta relay mode ON (${who}) — bypassing local Claude Code auth, ` +
+          `routing subprocess through pi-cas:relay-request responder`,
+      );
+    }
   }
 
   const badge = new FastModeBadge(pi);
@@ -527,7 +537,7 @@ export function registerProvider(pi: ExtensionAPI): void {
   pi.registerProvider(PROVIDER_ID, {
     name: "Claude (via Agent SDK)",
     baseUrl: PROVIDER_ID,
-    apiKey: "PI_CAS_UNUSED",
+    apiKey: "$PI_CAS_UNUSED",
     api: PROVIDER_ID as any,
     models,
     streamSimple: (model, context, options) =>
