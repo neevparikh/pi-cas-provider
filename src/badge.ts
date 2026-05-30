@@ -1,7 +1,7 @@
 /**
  * Fast-mode badge & event broadcasting.
  *
- * Event bus only: `pi-cas:fast-mode` events on `pi.events` carry the badge
+ * Event bus only: `pi:fast-mode` events on `pi.events` carry the badge
  * state so any extension can render it however it wants. pi-vim, for
  * instance, listens and paints the glyph next to its NORMAL/INSERT mode
  * label.
@@ -22,7 +22,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** Public event channel. Other extensions subscribe via `pi.events.on(EVENT, …)`. */
-export const EVENT = "pi-cas:fast-mode" as const;
+export const EVENT = "pi:fast-mode" as const;
 
 /** Payload broadcast on the event bus. */
 export interface FastModeEvent {
