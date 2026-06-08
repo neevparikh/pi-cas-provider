@@ -411,6 +411,16 @@ export async function startLogProxy(opts: LogProxyOptions): Promise<LogProxyHand
   const port = address.port;
   const host = opts.host ?? "127.0.0.1";
 
+  // Unref the listening socket so it never, by itself, keeps the Node event
+  // loop alive. Without this, a headless `pi --mode json -p` run (e.g. the one
+  // the subagent extension spawns) finishes the agent loop but the process
+  // hangs forever, because this still-listening server is an open handle that
+  // pins the loop open. Unref is safe: in-flight requests are kept alive by
+  // their own ref'd client/upstream sockets, and interactive sessions are kept
+  // alive by the TUI — so the proxy keeps serving normally and only stops
+  // blocking exit once everything else is genuinely idle.
+  server.unref();
+
   function getBaseUrl(): string {
     return `http://${host}:${port}${current.pathPrefix}`;
   }

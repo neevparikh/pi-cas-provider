@@ -341,6 +341,25 @@ export function registerProvider(pi: ExtensionAPI): void {
     );
   }
 
+  // Tear the HTTP log proxy down on shutdown so its listening socket is
+  // released. `server.unref()` already prevents it from blocking process exit
+  // (without that, a headless `pi --mode json -p` run hangs forever), but
+  // closing here also avoids leaking a stale listener across `/reload` (which
+  // fires session_shutdown with reason "reload" and re-runs registerProvider,
+  // starting a fresh proxy) and shuts down cleanly on "quit". This is separate
+  // from the per-SDK-session teardown in registerLifecycleHooks.
+  if (logProxyPromise) {
+    const proxyStartup = logProxyPromise;
+    pi.on("session_shutdown", async () => {
+      const handle = logProxyHandle ?? (await proxyStartup.catch(() => undefined));
+      try {
+        await handle?.close();
+      } catch {
+        /* best-effort: process is going away regardless */
+      }
+    });
+  }
+
   // Startup banners are diagnostic noise on every launch once your setup
   // is stable. Gate behind PI_CAS_DEBUG=1 so the terminal stays quiet by
   // default. Warnings and errors below this block remain unconditional.
